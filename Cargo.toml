@@ -1,0 +1,38 @@
+[package]
+name = "onebotfilter"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "OneBot v11 WebSocket filter gateway"
+repository = "https://github.com/Phantasmic-cloud/OneBotFilter"
+
+[[bin]]
+name = "onebotfilter"
+path = "src/main.rs"
+
+[lib]
+name = "onebotfilter"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.30", features = ["connect", "handshake", "rustls-tls-native-roots"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+fancy-regex = "0.20"
+notify = "8"
+parking_lot = "0.13"
+arc-swap = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+log = "0.4"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

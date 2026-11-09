@@ -1,0 +1,18 @@
+OneBotFilter 使用或参考了以下开源组件：
+
+- tokio (https://github.com/tokio-rs/tokio) — MIT License
+- tokio-tungstenite (https://github.com/snapview/tokio-tungstenite) — MIT License
+- tungstenite (https://github.com/snapview/tungstenite-rs) — MIT OR Apache-2.0
+- futures-util (https://github.com/rust-lang/futures-rs) — MIT OR Apache-2.0
+- serde / serde_json / serde_yaml_ng — MIT OR Apache-2.0 / MIT
+- fancy-regex (https://github.com/fancy-regex/fancy-regex) — MIT License
+- notify (https://github.com/notify-rs/notify) — CC0-1.0
+- parking_lot (https://github.com/Amanieu/parking_lot) — MIT OR Apache-2.0
+- arc-swap (https://github.com/vorner/arc-swap) — MIT OR Apache-2.0
+- chrono (https://github.com/chronotope/chrono) — MIT OR Apache-2.0
+- log (https://github.com/rust-lang/log) — MIT OR Apache-2.0
+- anyhow (https://github.com/dtolnay/anyhow) — MIT OR Apache-2.0
+- rustls / rustls-native-certs — Apache-2.0 OR ISC OR MIT
+- ring (https://github.com/briansmith/ring) — Apache-2.0 AND ISC
+
+OneBotFilter 自身以 Apache License 2.0 发布，全文见 LICENSE。

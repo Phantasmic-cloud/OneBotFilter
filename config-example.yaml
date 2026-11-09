@@ -1,0 +1,55 @@
+# OneBotFilter 配置示例
+#
+# 用法：复制成 config.yaml 后按需修改，与程序放在同一目录启动。
+# 除 group-id.mode、message.mode 外，其余项都有默认值，可以留空。
+# access-token 之类只在本文件占位，真实的 token 只写在 config.yaml，不要外传。
+
+server:
+  host: "127.0.0.1"        # 监听地址；要对外就改 0.0.0.0
+  port: 3939               # OneBot 客户端接入端口
+  suffix: "/ws"            # 接入路径，OneBot 客户端连 ws://<host>:<port>/ws
+  bot-id: "123456789"      # 本 bot 的账号（自身上报时用来判断 @我）
+  user-agent: "OneBotFilter"
+  superusers: [ 123456789 ] # 可用管理指令的账号，留空则无人可用
+  command-prefix: "/"      # 指令前缀，默认 /
+  db-path: "db.json"       # 运行时状态（群开关/黑用户/bot 名单）
+  buffer-size: 4096        # WebSocket 读写缓冲
+  sleep-time: 5            # 连接失败后重试间隔（秒）
+  debug: false             # 打开后打印每条消息的过滤判定
+
+# bot-apps：要接入的下游 bot 应用，可配多个
+bot-apps:
+  - name: "alpha"                # 指令里用的名字，不能带空格，也不能叫 status/enable/disable/bu/bot/group/on/off
+    alias: [ "a", "甲" ]          # 别名，同样不能与其它 name/alias 重复
+    uri: "ws://127.0.0.1:8080/onebot/v11/ws"  # 该 bot 应用的反向 WS 地址
+    access-token: ""             # 需要鉴权时填，连接时以 Bearer 头带上
+
+    group-id:                    # 群名单模式
+      mode: "whitelist"          # whitelist：Ids 里的群才转发；blacklist：Ids 里的群不转发
+
+    message:                     # 消息过滤总配置，private-message / group-message 缺省时继承这里
+      mode: "blacklist"          # on 全放行 | off 全拦截 | whitelist 命中才放行 | blacklist 命中才拦截
+      filters: [ "^(help|帮助)", "^/status" ]  # 正则列表（.NET 风格语法）
+      prefix: [ "#" ]            # 以此前缀开头的消息直接放行
+      prefix-replace: ""         # 放行时把前缀替换成这个（如 "" 直接吃掉前缀）
+
+    # 想分别配置私聊和群聊就取消下面两行注释；mode 填 default 表示继承 message
+    # private-message:
+    #   mode: "default"
+    # group-message:
+    #   mode: "default"
+
+    # 出站文本改写：bot 通过 OneBotFilter 发言时，按正则替换后再送出
+    rewrite-text:
+      - original: "v[0-9]+\\.[0-9]+\\.[0-9]+"
+        replace: "v1.0.0"
+      - original: "牛牛"
+        replace: "哞哞"
+
+  - name: "beta"
+    alias: [ "b" ]
+    uri: "ws://127.0.0.1:8081/onebot/v11/ws"
+    group-id:
+      mode: "blacklist"
+    message:
+      mode: "on"

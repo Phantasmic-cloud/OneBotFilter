@@ -1,0 +1,23 @@
+# Rust 构建产物
+/target/
+/dist/
+*.pdb
+*.log
+
+# 运行时文件：真实配置与状态绝不入库
+config.yaml
+db.json
+db.json.tmp
+
+# 编辑器与系统
+.idea/
+.vscode/
+*.iml
+*.swp
+.DS_Store
+
+# 密钥（永不提交）
+*.jks
+*.keystore
+keystore.properties
+credentials

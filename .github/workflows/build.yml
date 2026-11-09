@@ -1,0 +1,118 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+  build:
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: onebotfilter
+            artifact: onebotfilter-linux-amd64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: onebotfilter.exe
+            artifact: onebotfilter-windows-amd64.exe
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary: onebotfilter
+            artifact: onebotfilter-macos-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: |
+          cargo build --release --target "$TARGET"
+          mkdir -p dist
+          cp "target/$TARGET/release/$BIN" "dist/$ARTIFACT"
+        env:
+          TARGET: ${{ matrix.target }}
+          BIN: ${{ matrix.binary }}
+          ARTIFACT: ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Package example config and checksums
+        run: |
+          cp config-example.yaml dist/config-example.yaml
+          cd dist
+          sha256sum onebotfilter-* config-example.yaml > "SHA256SUMS-${GITHUB_REF_NAME}.txt"
+          cat "SHA256SUMS-${GITHUB_REF_NAME}.txt"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
