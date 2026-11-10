@@ -359,7 +359,7 @@ release profile 开了 `lto = "thin"`、`codegen-units = 1`、`strip = true`、`
 - `test`：ubuntu 上跑 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、
   `cargo test`；
 - `build`：三平台矩阵，用原生 runner 构建：`ubuntu-latest`（linux amd64）、
-  `windows-latest`（windows amd64）、`macos-14`（macos arm64），产物命名为
+  `windows-latest`（windows amd64）、`macos-15`（macos arm64），产物命名为
   `onebotfilter-linux-amd64` / `onebotfilter-windows-amd64.exe` / `onebotfilter-macos-arm64`，
   上传 artifact；
 - `release`：仅 `v*` tag，汇总三个 artifact + `config-example.yaml`，生成
