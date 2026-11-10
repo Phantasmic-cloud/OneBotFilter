@@ -16,6 +16,7 @@ cargo test
 - `db.json` 状态迁移（旧 `ids` → `groups`）、双名单、无用状态清理（`src/store.rs`）
 - 消息模型、OneBot action/echo/回包（`src/message.rs`、`src/onebot_api.rs`）
 - 消息解析、@我判断、CQ 码处理（`src/onebot_message.rs`）
+- 命令行参数解析（`src/lib.rs`）
 - 端到端：唯一上游限制（含并发）、群开关与指令、内容过滤、黑用户、
   私聊全局白名单 + per-bot 名单 + 私聊内容过滤、群号目标解析与缺参提醒、
   出站改写与回包抹除、db 清理

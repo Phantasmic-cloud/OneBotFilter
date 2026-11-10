@@ -42,6 +42,8 @@ cp config-example.yaml config.yaml
 OneBot 实现连到 `ws://127.0.0.1:3939/ws`；程序按 `bot-apps[].uri` 主动连接各 bot。
 日志出现 `OneBotFilter已启动 ...` 即就绪。
 
+程序支持 `-c/--config <路径>`（默认 `config.yaml`）、`-V/--version`、`-h/--help`。
+
 ## 文档
 
 - [协议、配置、指令与 API](./API.md)

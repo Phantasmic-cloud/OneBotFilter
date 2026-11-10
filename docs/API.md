@@ -184,3 +184,16 @@ x-client-role: Universal
 | 下游建连失败 | `server.sleep-time` 秒后重试 |
 | 下游建连后断开 | 固定 5s 后重连 |
 | 上游断开 | 清理 pending API 调用、复位流量，等待重新接入 |
+
+## 10. 命令行
+
+```text
+用法: onebotfilter [选项]
+
+选项:
+  -c, --config <路径>   配置文件路径（默认 config.yaml）
+  -V, --version         显示版本号
+  -h, --help            显示本帮助
+```
+
+未知参数会打印用法并以退出码 2 退出；配置文件/状态加载失败以退出码 1 退出。

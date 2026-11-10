@@ -44,6 +44,9 @@ cp config-example.yaml config.yaml
 The OneBot implementation connects to `ws://127.0.0.1:3939/ws`; the gateway
 dials every `bot-apps[].uri`. The log line `OneBotFilter已启动 ...` means ready.
 
+The binary accepts `-c/--config <path>` (default `config.yaml`), `-V/--version`
+and `-h/--help`.
+
 ## Docs
 
 - [Chinese guide](./docs/README_zh.md)
