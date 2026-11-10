@@ -160,4 +160,11 @@ mod tests {
         assert!(parse_cli(&args(&["--config"])).is_err());
         assert!(parse_cli(&args(&["--config="])).is_err());
     }
+
+    /// 回归：tokio-tungstenite 只开 rustls 的 std，不选加密后端。
+    /// 没有 provider 时 wss 连接会在运行时 panic，所以这里先构建一次 ClientConfig。
+    #[test]
+    fn rustls_has_crypto_provider() {
+        let _ = rustls::ClientConfig::builder();
+    }
 }

@@ -18,6 +18,9 @@ path = "src/lib.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.30", features = ["connect", "handshake", "rustls-tls-native-roots"] }
+# tokio-tungstenite 0.30 只打开 rustls 的 std，不选加密后端；
+# 不显式启用一个 provider 的话，wss:// 连接时 rustls 会 panic（CryptoProvider 无法自动确定）。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
