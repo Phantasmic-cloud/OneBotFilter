@@ -69,8 +69,13 @@ x-client-role: Universal
 | `/group status`、`/group <name>` | superuser | 群启用列表 / bot 群开关明细 |
 | `/group status private` | superuser | 全局私聊白名单 |
 | `/group <name> private` | superuser | 某 bot 的私聊详情 |
-| `/<name> on\|off` | superuser | 当前群在该 bot 群名单中的开关 |
+| `/<name> on\|off [群号]` | superuser | 该 bot 在指定群（默认当前群）的开关 |
 | `/<name> on\|off <qq> private` | superuser | 该 bot 私聊名单开关 |
+
+群号的解析规则对所有群内开关一致：写了的群号如果已加入（`get_group_list` 能查到）
+就作用于该群，否则（没写、未加入或不是正整数）一律作用于当前群。
+末尾带 `private` 时参数按 qq 处理，`数字 + private` 只改私聊名单、不会当群号；
+只写 `private` 而没跟 qq 会回一条缺参提示，不会被当成群号执行。
 
 ## 5. 配置参考
 

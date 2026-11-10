@@ -187,7 +187,10 @@ async fn connect_upstream(addr: SocketAddr) -> MockUpstream {
                                         let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
                                         let data = match action {
                                             "get_group_info" => json!({"group_id": 100, "group_name": "测试群"}),
-                                            "get_group_list" => json!([{"group_id": 100, "group_name": "测试群"}]),
+                                            "get_group_list" => json!([
+                                                {"group_id": 100, "group_name": "测试群"},
+                                                {"group_id": 200, "group_name": "测试群200"}
+                                            ]),
                                             "get_login_info" => json!({"user_id": 123456789, "nickname": "tester"}),
                                             _ => json!({}),
                                         };
@@ -575,6 +578,67 @@ async fn private_queries_and_commands() {
 }
 
 #[tokio::test]
+async fn command_targets_and_private_args() {
+    let (bot_uri, mut bot) = spawn_mock_bot().await;
+    let cfg = base_config(&bot_uri);
+    let initial_db = r#"{
+        "enabled_groups": [100],
+        "enabled_private_users": [],
+        "black_users": [],
+        "bots": {"alpha": {"groups": [], "users": []}},
+        "group_names": {"100": "本群", "200": "测试群200"},
+        "joined_groups": [100, 200]
+    }"#;
+    let (app, addr) = spawn_gateway(cfg, Some(initial_db)).await;
+    wait_for_client(&app, "alpha").await;
+    let mut up = connect_upstream(addr).await;
+
+    // /alpha off 200：显式指定已加入的群，改的是 200 而不是当前群
+    send_json(&up, group_message(100, 123456789, "/alpha off 200"));
+    let reply = recv_reply_text(&mut up).await;
+    assert!(reply.contains("200"), "reply = {reply}");
+    assert!(
+        !app.store.is_bot_group_allowed("alpha", BLACKLIST, 200),
+        "群 200 应对 alpha 关闭"
+    );
+    assert!(
+        app.store.is_bot_group_allowed("alpha", BLACKLIST, 100),
+        "当前群不应受影响"
+    );
+
+    // 缺 qq 的私聊开关：提醒缺参，且不能当普通消息转给 bot
+    send_json(&up, at_command(100, 123456789, "/enable private"));
+    let reply = recv_reply_text(&mut up).await;
+    assert!(reply.contains("缺少 QQ 号"), "reply = {reply}");
+    send_json(&up, group_message(100, 123456789, "/alpha on private"));
+    let reply = recv_reply_text(&mut up).await;
+    assert!(reply.contains("缺少 QQ 号"), "reply = {reply}");
+    expect_no_bot_message(&mut bot, Duration::from_millis(300)).await;
+
+    // /alpha off 999：群未加入 → 解析成当前群
+    send_json(&up, group_message(100, 123456789, "/alpha off 999"));
+    let reply = recv_reply_text(&mut up).await;
+    assert!(reply.contains("本群"), "reply = {reply}");
+    assert!(
+        !app.store.is_bot_group_allowed("alpha", BLACKLIST, 100),
+        "未加入的群号应回退到当前群"
+    );
+
+    // /alpha on 777 private：数字 + private → 改私聊名单
+    send_json(&up, group_message(100, 123456789, "/alpha on 777 private"));
+    let reply = recv_reply_text(&mut up).await;
+    assert!(reply.contains("已允许"), "reply = {reply}");
+    assert!(app.store.is_bot_private_allowed("alpha", WHITELIST, 777));
+
+    // /enable 200：显式群号开启
+    send_json(&up, at_command(100, 123456789, "/enable 200"));
+    let reply = recv_reply_text(&mut up).await;
+    assert!(reply.contains("已启用群聊"), "reply = {reply}");
+    assert!(reply.contains("200"), "reply = {reply}");
+    assert!(app.store.is_group_enabled(200));
+}
+
+#[tokio::test]
 async fn prunes_stale_runtime_state() {
     let (bot_uri, _bot) = spawn_mock_bot().await;
     // 初始 db 里塞入不存在的群 / bot 群名单 / 群名
@@ -590,7 +654,7 @@ async fn prunes_stale_runtime_state() {
     let (app, addr) = spawn_gateway(cfg, Some(initial_db)).await;
     wait_for_client(&app, "alpha").await;
     let _up = connect_upstream(addr).await;
-    // 上游连接 500ms 后会拉 get_group_list（mock 返回 [100]）
+    // 上游连接 500ms 后会拉 get_group_list（mock 返回 [100, 200]）
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
     assert!(app.store.is_group_enabled(100), "存在的群应保留启用状态");

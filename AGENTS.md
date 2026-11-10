@@ -87,7 +87,7 @@ x-client-role: Universal
 
 ```text
 群消息：
-  内置指令（enable/disable 及其 private 形态不受群开关限制）
+  内置指令（`/enable`、`/disable` 及私聊相关不要求群已启用）
   → 群是否启用（enabled_groups）
   → 发送者是否全局黑用户（black_users）
   → 每个 bot：mode.group 群名单 → message.group 内容过滤 → 转发
@@ -127,11 +127,16 @@ x-client-role: Universal
 | `/group status` / `/group <name>` | superuser | 群启用列表 / bot 群开关明细 |
 | `/group status private` | superuser | 全局私聊白名单 |
 | `/group <name> private` | superuser | 某 bot 私聊详情 |
-| `/<name> on\|off` | superuser | 当前群在该 bot 群名单中的开关 |
+| `/<name> on\|off [群号]` | superuser | 该 bot 在指定群（默认当前群）的开关 |
 | `/<name> on\|off <qq> private` | superuser | 该 bot 私聊名单开关 |
 
 注意：
 
+- 群号解析对两类开关共用：写了的群号如果已加入（`get_group_list` 能查到）就作用于该群，
+  否则（没写、未加入或不是正整数）一律作用于当前群；`/<name> on|off 200` 因此在显式
+  指定群时也安全；
+- 末尾 `private` 表示私聊操作，后面的数字按 qq 处理：`数字 + private` 只改私聊名单，
+  不会当群号；只写 `private` 没跟 qq 会回一条缺参提示，不会误执行群开关；
 - `/enable`、`/disable` 必须 @bot 才被当作指令，没 @ 会原样放行给 bot；
 - 指令处理可能调用 OneBot API（比如解析群名），所以必须在独立 task 里跑
   （`dispatch::handle_group_event` 已经是 spawn 出去的）：在读循环里同步等 API 回包会死锁；
@@ -254,7 +259,8 @@ bot → 上游的「发言类」API（`send_msg`、`send_group_msg`、`send_priv
 - `cargo test`：单测在各模块 `#[cfg(test)] mod tests`；集成测试在 `tests/gateway.rs`
   （进程内起 mock OneBot 上游 + mock bot 下游），覆盖：
   唯一上游限制（含并发）、群开关与指令、群内容过滤/黑用户、私聊全局白名单 +
-  per-bot 名单 + 私聊内容过滤、`private` 参数指令与查询、出站改写与回包抹除、db 清理。
+  per-bot 名单 + 私聊内容过滤、`private` 参数指令与查询、群号目标解析与缺参提醒、
+  出站改写与回包抹除、db 清理。
 - 需要真实 OneBot 实现与 bot 应用的联调不在 CI 里做：本地起一个空 `bot-apps`
   的配置确认能监听，再接入真实环境看日志。
 - CI（`.github/workflows/build.yml`）在 push / PR 上跑 `cargo fmt --check`、
@@ -291,7 +297,8 @@ release profile 开了 `lto = "thin"`、`codegen-units = 1`、`strip = true`、`
 
 1. 在 `src/command.rs` 的 `try_handle_command` 里识别指令形态（大小写、别名、是否要 @bot、
    末位 `private` 参数的含义）；
-2. 在 `needs_super` / `private_related` 里决定权限和是否受群开关限制；
+2. 在 `needs_super` / `private_switch_qq` / `is_private_query` 里决定权限、私聊形态和
+   是否受群开关限制（群号目标统一走 `resolve_target_group`，未加入回退当前群）；
 3. 写处理函数，通过 `reply_group_text` 回复，不要自己拼 WebSocket 帧；
 4. 更新 `docs/README_zh.md` 与 `docs/API.md` 的指令表。
 

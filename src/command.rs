@@ -1,8 +1,12 @@
 //! 内置管理指令与状态文案。
 //!
-//! 私聊相关操作不新增顶层指令，统一在原有指令后面加 `private` 参数：
-//! - `@bot /enable <qq> private` / `@bot /disable <qq> private`：全局私聊白名单
-//! - `/<bot> on|off <qq> private`：该 bot 的私聊用户名单
+//! 群与私聊的开关共用一套参数解析：
+//! - `/enable|disable [<群号>]`、`/<bot> on|off [<群号>]`：目标群已加入才生效，
+//!   没加入（或没写群号）就按当前群处理；
+//! - 私聊相关操作不新增顶层指令，统一在原有指令后面加 `private` 参数：
+//!   - `@bot /enable <qq> private` / `@bot /disable <qq> private`：全局私聊白名单
+//!   - `/<bot> on|off <qq> private`：该 bot 的私聊用户名单
+//!   - 带 `private` 但没写 qq 时提醒缺参，不会误当成群号；
 //! - `/group status private`：全局私聊白名单列表
 //! - `/group <bot> private`：某 bot 的私聊详情
 
@@ -72,26 +76,24 @@ pub async fn try_handle_command(
     let is_bot = cmd == "bot";
     let is_group = cmd == "group";
 
-    // /enable <qq> private / /disable <qq> private
-    let is_private_user_switch = is_enable_disable && private_flag && args_no_private.len() == 1;
-
-    // /<bot> on|off <qq> private
-    let bot_on_off_private = parts.len() >= 2
+    // /<bot> on|off [...]
+    let bot_on_off = parts.len() >= 2
         && app.find_bot_app(parts[0]).is_some()
-        && (parts[1].eq_ignore_ascii_case("on") || parts[1].eq_ignore_ascii_case("off"))
-        && private_flag
-        && args_no_private.len() == 2
-        && args_no_private[0].eq_ignore_ascii_case(parts[1])
-        && args_no_private[1]
-            .parse::<i64>()
-            .map(|v| v > 0)
-            .unwrap_or(false);
+        && (parts[1].eq_ignore_ascii_case("on") || parts[1].eq_ignore_ascii_case("off"));
 
-    // /<bot> on|off（当前群）
-    let is_bot_on_off = parts.len() >= 2
-        && !private_flag
-        && (parts[1].eq_ignore_ascii_case("on") || parts[1].eq_ignore_ascii_case("off"))
-        && app.find_bot_app(parts[0]).is_some();
+    // 私聊开关：末尾私聊参数 + qq，直接改 db.json
+    // - /enable|disable <qq> private
+    // - /<bot> on|off <qq> private
+    // Some(None) 表示形态对但缺 qq。
+    let private_switch_qq: Option<Option<&str>> = if !private_flag {
+        None
+    } else if is_enable_disable {
+        Some(args_no_private.first().copied())
+    } else if bot_on_off {
+        Some(args_no_private.get(1).copied())
+    } else {
+        None
+    };
 
     // /group status private / /group <bot> private
     let is_private_query = is_group && private_flag && args_no_private.len() == 1;
@@ -101,10 +103,9 @@ pub async fn try_handle_command(
         return None;
     }
 
-    let needs_super = is_enable_disable || is_bu || is_group || is_bot_on_off || bot_on_off_private;
+    let needs_super = is_enable_disable || is_bu || is_group || bot_on_off;
 
-    let is_builtin =
-        is_enable_disable || is_bu || is_bot || is_group || is_bot_on_off || bot_on_off_private;
+    let is_builtin = needs_super || is_bot;
     if !is_builtin {
         return None;
     }
@@ -113,32 +114,35 @@ pub async fn try_handle_command(
         return Some(String::new()); // 静默
     }
 
-    // enable/disable 与私聊相关的管理/查询不要求当前群已启用
-    let private_related = is_private_user_switch || bot_on_off_private || is_private_query;
-    if !is_enable_disable && !private_related && !app.store.is_group_enabled(cur_group) {
+    // 私聊开关：只认末尾 private 后面的 qq，不去猜群号
+    if let Some(qq) = private_switch_qq {
+        let enable = if is_enable_disable {
+            cmd == "enable"
+        } else {
+            parts[1].eq_ignore_ascii_case("on")
+        };
+        if is_enable_disable {
+            return Some(match qq {
+                Some(qq) => handle_private_user_switch(&app, qq, enable),
+                None => missing_private_qq(&format!("{prefix}enable|disable <qq> private")),
+            });
+        }
+        let bot_name = parts[0];
+        return Some(match qq {
+            Some(qq) => handle_bot_private_switch(&app, bot_name, enable, qq),
+            None => missing_private_qq(&format!("{prefix}{bot_name} on|off <qq> private")),
+        });
+    }
+
+    // enable/disable 与私聊查询不要求当前群已启用
+    if !is_enable_disable && !is_private_query && !app.store.is_group_enabled(cur_group) {
         return Some(String::new()); // 静默
-    }
-
-    if is_private_user_switch {
-        return Some(handle_private_user_switch(
-            &app,
-            args_no_private[0],
-            cmd == "enable",
-        ));
-    }
-
-    if bot_on_off_private {
-        return Some(handle_bot_private_switch(
-            &app,
-            parts[0],
-            parts[1].eq_ignore_ascii_case("on"),
-            args_no_private[1],
-        ));
     }
 
     match cmd.as_str() {
         "enable" | "disable" => {
-            let target = resolve_target_group(&app, cur_group, args_no_private).await;
+            let target =
+                resolve_target_group(&app, cur_group, args_no_private.first().copied()).await;
             if cmd == "enable" {
                 if let Err(e) = app.store.enable_group(target) {
                     return Some(format!("enable 失败: {}", e));
@@ -162,34 +166,59 @@ pub async fn try_handle_command(
                 Some(handle_group_command(&app, args).await)
             }
         }
-        _ => {
-            if is_bot_on_off {
-                let cfg = app.find_bot_app(parts[0])?;
-                let enable = parts[1].eq_ignore_ascii_case("on");
-                if let Err(e) =
-                    app.store
-                        .set_bot_group(&cfg.name, &cfg.mode.group, cur_group, enable)
-                {
-                    return Some(e);
-                }
-                if enable {
-                    Some(format!("已启用本群的{}", cfg.name))
-                } else {
-                    Some(format!("已禁用本群的{}", cfg.name))
-                }
-            } else {
-                None
+        _ if bot_on_off => {
+            let cfg = app.find_bot_app(parts[0])?;
+            let enable = parts[1].eq_ignore_ascii_case("on");
+            let target =
+                resolve_target_group(&app, cur_group, args_no_private.get(1).copied()).await;
+            if let Err(e) = app
+                .store
+                .set_bot_group(&cfg.name, &cfg.mode.group, target, enable)
+            {
+                return Some(e);
             }
+            Some(bot_group_switch_reply(
+                &app, &cfg.name, cur_group, target, enable,
+            ))
         }
+        _ => None,
     }
 }
 
-fn parse_positive_qq(s: &str) -> Option<i64> {
+fn parse_positive_id(s: &str) -> Option<i64> {
     s.parse::<i64>().ok().filter(|v| *v > 0)
 }
 
+/// 私聊开关缺 qq 时的提醒。
+fn missing_private_qq(usage: &str) -> String {
+    format!("缺少 QQ 号，用法: {}", usage)
+}
+
+/// 群开关回包：当前群沿用「本群」说法，显式指定其它群时带上群名。
+fn bot_group_switch_reply(
+    app: &App,
+    bot_name: &str,
+    cur_group: i64,
+    target: i64,
+    enable: bool,
+) -> String {
+    if target == cur_group {
+        return format!(
+            "已{}本群的{}",
+            if enable { "启用" } else { "禁用" },
+            bot_name
+        );
+    }
+    format!(
+        "已为群聊 {} {} {}",
+        app.store.format_group_line(target),
+        if enable { "启用" } else { "禁用" },
+        bot_name
+    )
+}
+
 fn handle_private_user_switch(app: &App, qq: &str, enable: bool) -> String {
-    let Some(qq) = parse_positive_qq(qq) else {
+    let Some(qq) = parse_positive_id(qq) else {
         return "qq 无效".to_string();
     };
     if enable {
@@ -211,7 +240,7 @@ fn handle_bot_private_switch(app: &App, bot_name: &str, enable: bool, qq: &str) 
     let Some(cfg) = app.find_bot_app(bot_name) else {
         return String::new();
     };
-    let Some(qq) = parse_positive_qq(qq) else {
+    let Some(qq) = parse_positive_id(qq) else {
         return "qq 无效".to_string();
     };
     match app
@@ -236,14 +265,10 @@ fn handle_bot_private_switch(app: &App, bot_name: &str, enable: bool, qq: &str) 
     }
 }
 
-/// 有群号且已加入 → 用该群；否则当前群。
-async fn resolve_target_group(app: &Arc<App>, cur_group: i64, args: &[&str]) -> i64 {
-    if args.is_empty() {
+/// 显式群号且已加入 → 用该群；没写或未加入都退回当前群。
+async fn resolve_target_group(app: &Arc<App>, cur_group: i64, target: Option<&str>) -> i64 {
+    let Some(gid) = target.and_then(parse_positive_id) else {
         return cur_group;
-    }
-    let gid: i64 = match args[0].parse() {
-        Ok(v) if v > 0 => v,
-        _ => return cur_group,
     };
     if !app.store.is_joined_group(gid) {
         api::refresh_joined_groups(app).await;
@@ -799,10 +824,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_positive_qq() {
-        assert_eq!(parse_positive_qq("123456789"), Some(123456789));
-        assert_eq!(parse_positive_qq("0"), None);
-        assert_eq!(parse_positive_qq("-1"), None);
-        assert_eq!(parse_positive_qq("abc"), None);
+    fn parses_positive_id() {
+        assert_eq!(parse_positive_id("123456789"), Some(123456789));
+        assert_eq!(parse_positive_id("0"), None);
+        assert_eq!(parse_positive_id("-1"), None);
+        assert_eq!(parse_positive_id("abc"), None);
     }
 }

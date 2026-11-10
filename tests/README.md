@@ -17,6 +17,7 @@ cargo test
 - 消息模型、OneBot action/echo/回包（`src/message.rs`、`src/onebot_api.rs`）
 - 消息解析、@我判断、CQ 码处理（`src/onebot_message.rs`）
 - 端到端：唯一上游限制（含并发）、群开关与指令、内容过滤、黑用户、
-  私聊全局白名单 + per-bot 名单 + 私聊内容过滤、出站改写与回包抹除、db 清理
+  私聊全局白名单 + per-bot 名单 + 私聊内容过滤、群号目标解析与缺参提醒、
+  出站改写与回包抹除、db 清理
 
 与 Go 旧版的差分对比脚本是本地维护的，不放进仓库；CI 只跑 `fmt` / `clippy` / `test`。
