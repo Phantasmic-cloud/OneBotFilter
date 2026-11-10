@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::config::BotAppsConfig;
 use crate::filters::Filter;
 use crate::global::{App, Client, ClientWrite, LatencyRequest, UpstreamWrite};
-use crate::stats::is_outbound_send_action;
+use crate::onebot_api::is_send_frame;
 
 type PongWaiters = Arc<Mutex<Vec<oneshot::Sender<Instant>>>>;
 
@@ -215,7 +215,7 @@ fn handle_bot_frame(
         }
     };
 
-    if is_text && is_outbound_send_action(raw) {
+    if is_text && is_send_frame(raw) {
         let data = {
             let f = filter.read();
             f.rewrite_outbound(app, raw).unwrap_or_else(|| raw.to_vec())
@@ -264,7 +264,11 @@ async fn measure_latency(
             app.update_stat(name, |s| s.last_latency = d);
             Ok(d)
         }
-        _ => Err("ping 超时".to_string()),
+        _ => {
+            // 对端不回 pong 时把已超时的 waiter 清掉，避免 Vec 无限增长。
+            waiters.lock().retain(|w| !w.is_closed());
+            Err("ping 超时".to_string())
+        }
     }
 }
 

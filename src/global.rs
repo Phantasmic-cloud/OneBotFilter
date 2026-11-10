@@ -4,7 +4,7 @@
 //! 由 `main` / 集成测试创建一份，用 `Arc` 共享给各个任务。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -98,6 +98,8 @@ pub struct App {
     pub rewrite: Mutex<RewriteTracker>,
     pub onebot_recv: AtomicU64,
     pub onebot_send: AtomicU64,
+    /// 上游只有一条连接：握手阶段用 CAS 占坑，避免两个连接同时通过检查。
+    upstream_slot: AtomicBool,
 }
 
 #[derive(Default)]
@@ -130,6 +132,7 @@ impl App {
             rewrite: Mutex::new(RewriteTracker::default()),
             onebot_recv: AtomicU64::new(0),
             onebot_send: AtomicU64::new(0),
+            upstream_slot: AtomicBool::new(false),
         }
     }
 
@@ -225,6 +228,17 @@ impl App {
 
     pub fn is_onebot_connected(&self) -> bool {
         self.upstream.read().tx.is_some()
+    }
+
+    /// 尝试占用唯一的上游连接位；成功返回 true。
+    pub fn try_acquire_upstream(&self) -> bool {
+        self.upstream_slot
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    pub fn release_upstream(&self) {
+        self.upstream_slot.store(false, Ordering::SeqCst);
     }
 
     pub fn inc_onebot_recv(&self) {

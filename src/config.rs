@@ -1,4 +1,10 @@
-//! 配置结构、校验与热更新。字段名与 Go 版 `config.go` 完全一致（YAML kebab-case）。
+//! 配置结构、校验与热更新。
+//!
+//! 第二代 schema：
+//! - `mode.group` / `mode.private`：per-bot 群名单 / 私聊用户名单的白黑模式；
+//! - `message.group` / `message.private`：两种会话各自的消息过滤配置；
+//! - 旧的 `group-id` / `group-message` / `private-message` / 扁平 `message` 不再兼容，
+//!   加载时会给出明确的迁移错误。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,7 +13,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::global::App;
-use crate::global::{BLACKLIST, DEFAULT, OFF, ON, WHITELIST};
+use crate::global::{BLACKLIST, OFF, ON, WHITELIST};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
@@ -30,6 +36,8 @@ pub struct ServerConfig {
     pub buffer_size: i32,
     pub sleep_time: f32,
     pub debug: bool,
+    /// 是否自动清理 db.json 里已经不存在的 bot / 群相关状态。
+    pub prune_runtime_state: bool,
 }
 
 impl Default for ServerConfig {
@@ -46,31 +54,40 @@ impl Default for ServerConfig {
             buffer_size: 4096,
             sleep_time: 5.0,
             debug: false,
+            prune_runtime_state: true,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 pub struct BotAppsConfig {
     pub name: String,
     pub alias: Vec<String>,
     pub uri: String,
     pub access_token: String,
-    pub group_id: GroupIdConfig,
-    pub private_message: MessageConfig,
-    pub group_message: MessageConfig,
-    pub message: MessageConfig,
+    /// 群名单 / 私聊用户名单的白黑模式。
+    pub mode: ModeConfig,
+    /// 群消息 / 私聊消息的过滤配置。
+    pub message: BotMessageConfig,
     pub rewrite_text: Vec<RewriteTextRule>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
-pub struct GroupIdConfig {
-    pub mode: String,
+pub struct ModeConfig {
+    pub group: String,
+    pub private: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct BotMessageConfig {
+    pub group: MessageConfig,
+    pub private: MessageConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 pub struct MessageConfig {
     pub mode: String,
@@ -79,7 +96,7 @@ pub struct MessageConfig {
     pub prefix_replace: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
 pub struct RewriteTextRule {
     pub original: String,
@@ -129,6 +146,16 @@ fn reserved_bot_token(s: &str) -> Result<(), String> {
     }
 }
 
+fn check_message_config(prefix: &str, cfg: &MessageConfig) -> Result<(), String> {
+    match cfg.mode.as_str() {
+        "" | ON | OFF | WHITELIST | BLACKLIST => Ok(()),
+        _ => Err(format!(
+            "{}.mode 配置错误，只能是 on、off、whitelist 或 blacklist",
+            prefix
+        )),
+    }
+}
+
 impl BotAppsConfig {
     pub fn check(&mut self) -> Result<(), String> {
         if self.name.is_empty() {
@@ -146,50 +173,29 @@ impl BotAppsConfig {
         if self.uri.is_empty() {
             return Err(format!("{}.uri不能为空", self.name));
         }
-        match self.group_id.mode.as_str() {
+        match self.mode.group.as_str() {
             WHITELIST | BLACKLIST => {}
             _ => {
                 return Err(format!(
-                    "{}.group-id.mode 必须是 whitelist 或 blacklist",
+                    "{}.mode.group 必须是 whitelist 或 blacklist",
                     self.name
                 ))
             }
         }
-        match self.message.mode.as_str() {
-            "" | ON | OFF | WHITELIST | BLACKLIST => {}
+        match self.mode.private.as_str() {
+            WHITELIST | BLACKLIST => {}
             _ => {
                 return Err(format!(
-                    "{}.message.mode配置错误，只能是 on、off、whitelist 或 blacklist",
+                    "{}.mode.private 必须是 whitelist 或 blacklist",
                     self.name
                 ))
             }
         }
-        if self.private_message.mode.is_empty() || self.private_message.mode == DEFAULT {
-            self.private_message = self.message.clone();
-        } else {
-            match self.private_message.mode.as_str() {
-                ON | OFF | WHITELIST | BLACKLIST => {}
-                _ => {
-                    return Err(format!(
-                        "{}.private-message.mode配置错误，只能是 on、off、whitelist 或 blacklist",
-                        self.name
-                    ))
-                }
-            }
-        }
-        if self.group_message.mode.is_empty() || self.group_message.mode == DEFAULT {
-            self.group_message = self.message.clone();
-        } else {
-            match self.group_message.mode.as_str() {
-                ON | OFF | WHITELIST | BLACKLIST => {}
-                _ => {
-                    return Err(format!(
-                        "{}.group-message.mode配置错误，只能是 on、off、whitelist 或 blacklist",
-                        self.name
-                    ))
-                }
-            }
-        }
+        check_message_config(&format!("{}.message.group", self.name), &self.message.group)?;
+        check_message_config(
+            &format!("{}.message.private", self.name),
+            &self.message.private,
+        )?;
         for (i, rule) in self.rewrite_text.iter().enumerate() {
             if rule.original.trim().is_empty() {
                 return Err(format!(
@@ -283,9 +289,42 @@ impl Config {
     }
 }
 
+/// 旧版配置字段检测：给出明确迁移提示，而不是静默忽略。
+fn detect_legacy_fields(raw: &serde_json::Value) -> Result<(), String> {
+    let Some(bots) = raw.get("bot-apps").and_then(|b| b.as_array()) else {
+        return Ok(());
+    };
+    for (i, bot) in bots.iter().enumerate() {
+        let Some(map) = bot.as_object() else { continue };
+        for old in ["group-id", "group-message", "private-message"] {
+            if map.contains_key(old) {
+                return Err(format!(
+                    "bot-apps[{i}] 使用了旧字段 {old:?}；新版改为 mode.group/mode.private 与 \
+                     message.group/message.private，请参考 config-example.yaml 迁移"
+                ));
+            }
+        }
+        if let Some(message) = map.get("message").and_then(|m| m.as_object()) {
+            let is_old_flat = ["mode", "filters", "prefix", "prefix-replace"]
+                .iter()
+                .any(|k| message.contains_key(*k));
+            if is_old_flat {
+                return Err(format!(
+                    "bot-apps[{i}].message 使用了旧扁平结构；新版拆成 \
+                     message.group / message.private，请参考 config-example.yaml 迁移"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 读取并校验配置文件。
 pub fn load_config(path: &str) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let probe: serde_json::Value = serde_yaml_ng::from_str(&text).map_err(|e| e.to_string())?;
+    detect_legacy_fields(&probe)?;
+
     let mut cfg: Config = serde_yaml_ng::from_str(&text).map_err(|e| e.to_string())?;
     cfg.check()?;
     Ok(cfg)
@@ -315,6 +354,7 @@ pub fn spawn_watcher(app: Arc<App>, path: String) {
             log::error!("监听配置文件失败: {}", e);
             return;
         }
+
         let file_name = file.file_name().map(|n| n.to_owned());
         let mut last = Instant::now()
             .checked_sub(Duration::from_secs(60))
@@ -351,6 +391,7 @@ fn reload(app: &App, path: &str) {
     log::info!("config file changed: {}", path);
     match load_config(path) {
         Ok(cfg) => {
+            app.store.prune_config_bots(&cfg);
             app.store.sync_bots_from_config(&cfg);
             app.set_config(cfg);
             app.reload_filters();
@@ -364,7 +405,7 @@ impl Config {
         format!("{}:{}", self.server.host, self.server.port)
     }
 
-    /// 配置文件同目录路径（用于热更日志等）。
+    /// 配置文件同目录路径。
     pub fn same_dir(path: &str) -> PathBuf {
         Path::new(path)
             .parent()
@@ -393,12 +434,19 @@ mod tests {
         BotAppsConfig {
             name: name.into(),
             uri: "ws://127.0.0.1:8080/onebot/v11/ws".into(),
-            group_id: GroupIdConfig {
-                mode: BLACKLIST.into(),
+            mode: ModeConfig {
+                group: BLACKLIST.into(),
+                private: WHITELIST.into(),
             },
-            message: MessageConfig {
-                mode: ON.into(),
-                ..Default::default()
+            message: BotMessageConfig {
+                group: MessageConfig {
+                    mode: ON.into(),
+                    ..Default::default()
+                },
+                private: MessageConfig {
+                    mode: ON.into(),
+                    ..Default::default()
+                },
             },
             ..Default::default()
         }
@@ -443,12 +491,13 @@ mod tests {
         sc.check().unwrap();
         assert_eq!(sc.command_prefix, "/");
         assert_eq!(sc.db_path, "db.json");
+        assert!(sc.prune_runtime_state);
     }
-
-    type BotCase = (&'static str, Box<dyn Fn(&mut BotAppsConfig)>);
 
     #[test]
     fn bot_app_rules() {
+        type BotCase = (&'static str, Box<dyn Fn(&mut BotAppsConfig)>);
+
         let cases: Vec<BotCase> = vec![
             (
                 "name 带空格",
@@ -464,12 +513,20 @@ mod tests {
             ),
             ("uri 为空", Box::new(|b: &mut BotAppsConfig| b.uri.clear())),
             (
-                "group-id.mode 非法",
-                Box::new(|b: &mut BotAppsConfig| b.group_id.mode = "all".into()),
+                "mode.group 非法",
+                Box::new(|b: &mut BotAppsConfig| b.mode.group = "all".into()),
             ),
             (
-                "message.mode 非法",
-                Box::new(|b: &mut BotAppsConfig| b.message.mode = "yes".into()),
+                "mode.private 缺失",
+                Box::new(|b: &mut BotAppsConfig| b.mode.private.clear()),
+            ),
+            (
+                "message.group.mode 非法",
+                Box::new(|b: &mut BotAppsConfig| b.message.group.mode = "yes".into()),
+            ),
+            (
+                "message.private.mode 非法",
+                Box::new(|b: &mut BotAppsConfig| b.message.private.mode = "yes".into()),
             ),
             (
                 "正则非法",
@@ -528,20 +585,35 @@ mod tests {
     }
 
     #[test]
-    fn message_mode_inheritance() {
-        let mut bot = valid_bot("alpha");
-        bot.message = MessageConfig {
-            mode: WHITELIST.into(),
-            filters: vec!["^hi".into()],
-            ..Default::default()
-        };
-        let mut cfg = Config {
-            server: valid_server(),
-            bot_apps: vec![bot],
-        };
-        cfg.check().unwrap();
-        assert_eq!(cfg.bot_apps[0].group_message.mode, WHITELIST);
-        assert_eq!(cfg.bot_apps[0].group_message.filters.len(), 1);
-        assert_eq!(cfg.bot_apps[0].private_message.mode, WHITELIST);
+    fn detects_legacy_fields() {
+        let old_group_id = serde_json::json!({
+            "bot-apps": [{
+                "name": "alpha",
+                "uri": "ws://127.0.0.1:8080/onebot/v11/ws",
+                "group-id": { "mode": "blacklist" },
+                "message": { "mode": "on" }
+            }]
+        });
+        assert!(detect_legacy_fields(&old_group_id).is_err());
+
+        let old_flat_message = serde_json::json!({
+            "bot-apps": [{
+                "name": "alpha",
+                "uri": "ws://127.0.0.1:8080/onebot/v11/ws",
+                "mode": { "group": "blacklist", "private": "whitelist" },
+                "message": { "mode": "on" }
+            }]
+        });
+        assert!(detect_legacy_fields(&old_flat_message).is_err());
+
+        let current = serde_json::json!({
+            "bot-apps": [{
+                "name": "alpha",
+                "uri": "ws://127.0.0.1:8080/onebot/v11/ws",
+                "mode": { "group": "blacklist", "private": "whitelist" },
+                "message": { "group": { "mode": "on" }, "private": { "mode": "on" } }
+            }]
+        });
+        assert!(detect_legacy_fields(&current).is_ok());
     }
 }

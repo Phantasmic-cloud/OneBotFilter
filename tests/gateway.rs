@@ -1,4 +1,7 @@
-//! 进程内集成测试：mock OneBot 上游 + mock bot 下游，验证闸门、指令、过滤与改写。
+//! 进程内集成测试：mock OneBot 上游 + mock bot 下游。
+//!
+//! 覆盖：群/私聊闸门、名单模式、内置指令（含 private 参数）、出站改写与回包抹除、
+//! db.json 无用状态清理、单上游并发限制。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,9 +16,10 @@ use tokio_tungstenite::tungstenite::Message;
 
 use onebotfilter::client::ws_client_handler;
 use onebotfilter::config::{
-    BotAppsConfig, Config, GroupIdConfig, MessageConfig, RewriteTextRule, ServerConfig,
+    BotAppsConfig, BotMessageConfig, Config, MessageConfig, ModeConfig, RewriteTextRule,
+    ServerConfig,
 };
-use onebotfilter::global::{App, BLACKLIST, ON};
+use onebotfilter::global::{App, BLACKLIST, ON, WHITELIST};
 use onebotfilter::server::accept_loop;
 use onebotfilter::store::Store;
 
@@ -34,7 +38,7 @@ fn temp_db_path() -> String {
     dir.join("db.json").to_str().unwrap().to_string()
 }
 
-fn test_config(bot_uri: &str, message: MessageConfig, rewrite: Vec<RewriteTextRule>) -> Config {
+fn base_config(bot_uri: &str) -> Config {
     Config {
         server: ServerConfig {
             host: "127.0.0.1".into(),
@@ -49,19 +53,32 @@ fn test_config(bot_uri: &str, message: MessageConfig, rewrite: Vec<RewriteTextRu
         bot_apps: vec![BotAppsConfig {
             name: "alpha".into(),
             uri: bot_uri.into(),
-            group_id: GroupIdConfig {
-                mode: BLACKLIST.into(),
+            mode: ModeConfig {
+                group: BLACKLIST.into(),
+                private: WHITELIST.into(),
             },
-            message,
-            rewrite_text: rewrite,
+            message: BotMessageConfig {
+                group: MessageConfig {
+                    mode: ON.into(),
+                    ..Default::default()
+                },
+                private: MessageConfig {
+                    mode: ON.into(),
+                    ..Default::default()
+                },
+            },
             ..Default::default()
         }],
     }
 }
 
-async fn spawn_gateway(mut cfg: Config) -> (Arc<App>, SocketAddr) {
+async fn spawn_gateway(mut cfg: Config, initial_db: Option<&str>) -> (Arc<App>, SocketAddr) {
     cfg.check().expect("测试配置应合法");
-    let store = Store::load(&temp_db_path(), &cfg).unwrap();
+    let db_path = temp_db_path();
+    if let Some(db) = initial_db {
+        std::fs::write(&db_path, db).unwrap();
+    }
+    let store = Store::load(&db_path, &cfg).unwrap();
     let bot_cfgs = cfg.bot_apps.clone();
     let app = Arc::new(App::new(cfg, store));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -167,10 +184,17 @@ async fn connect_upstream(addr: SocketAddr) -> MockUpstream {
                                     };
                                     let echo = v.get("echo").and_then(|e| e.as_str()).unwrap_or("");
                                     if echo.starts_with("obf_") {
+                                        let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
+                                        let data = match action {
+                                            "get_group_info" => json!({"group_id": 100, "group_name": "测试群"}),
+                                            "get_group_list" => json!([{"group_id": 100, "group_name": "测试群"}]),
+                                            "get_login_info" => json!({"user_id": 123456789, "nickname": "tester"}),
+                                            _ => json!({}),
+                                        };
                                         let resp = json!({
                                             "status": "ok",
                                             "retcode": 0,
-                                            "data": {},
+                                            "data": data,
                                             "echo": echo,
                                         });
                                         let _ = sink.send(Message::Text(resp.to_string().into())).await;
@@ -218,8 +242,37 @@ fn group_message(group_id: i64, user_id: i64, text: &str) -> Value {
     })
 }
 
+fn private_message(user_id: i64, text: &str) -> Value {
+    json!({
+        "post_type": "message",
+        "message_type": "private",
+        "message_format": "array",
+        "message_id": 2001,
+        "user_id": user_id,
+        "raw_message": text,
+        "message": [{"type": "text", "data": {"text": text}}],
+    })
+}
+
+/// 带 @bot 的指令消息（enable/disable 需要 @）。
+fn at_command(group_id: i64, user_id: i64, text: &str) -> Value {
+    json!({
+        "post_type": "message",
+        "message_type": "group",
+        "message_format": "array",
+        "message_id": 1002,
+        "user_id": user_id,
+        "group_id": group_id,
+        "raw_message": format!("[CQ:at,qq={}] {}", BOT_ID, text),
+        "message": [
+            {"type": "at", "data": {"qq": BOT_ID}},
+            {"type": "text", "data": {"text": text}}
+        ],
+    })
+}
+
 async fn recv_action(up: &mut MockUpstream, action: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     loop {
         let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
         match timeout(remain, up.rx.recv()).await {
@@ -233,23 +286,29 @@ async fn recv_action(up: &mut MockUpstream, action: &str) -> Value {
     }
 }
 
-async fn expect_no_action(up: &mut MockUpstream, action: &str, wait: Duration) {
-    let deadline = tokio::time::Instant::now() + wait;
-    loop {
-        let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remain.is_zero() {
-            return;
-        }
-        match timeout(remain, up.rx.recv()).await {
-            Ok(Some(v)) => {
-                assert_ne!(
-                    v.get("action").and_then(|a| a.as_str()),
-                    Some(action),
-                    "不应出现 action={action}: {v}"
-                );
-            }
-            _ => return,
-        }
+async fn recv_reply_text(up: &mut MockUpstream) -> String {
+    let v = recv_action(up, "send_group_msg").await;
+    v["params"]["message"]
+        .as_array()
+        .map(|segs| {
+            segs.iter()
+                .filter_map(|s| {
+                    if s["type"] == "text" {
+                        s["data"]["text"].as_str().map(|t| t.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+async fn recv_bot_message(bot: &mut MockBot, wait: Duration) -> Option<Value> {
+    match timeout(wait, bot.rx.recv()).await {
+        Ok(Some(Message::Text(t))) => serde_json::from_str(t.as_str()).ok(),
+        _ => None,
     }
 }
 
@@ -262,15 +321,8 @@ async fn expect_no_bot_message(bot: &mut MockBot, wait: Duration) {
 #[tokio::test]
 async fn single_upstream_group_gate_and_commands() {
     let (bot_uri, mut bot) = spawn_mock_bot().await;
-    let cfg = test_config(
-        &bot_uri,
-        MessageConfig {
-            mode: ON.into(),
-            ..Default::default()
-        },
-        vec![],
-    );
-    let (app, addr) = spawn_gateway(cfg).await;
+    let cfg = base_config(&bot_uri);
+    let (app, addr) = spawn_gateway(cfg, None).await;
     wait_for_client(&app, "alpha").await;
     let mut up = connect_upstream(addr).await;
 
@@ -279,67 +331,42 @@ async fn single_upstream_group_gate_and_commands() {
     assert!(second.is_err(), "第二个上游连接应被拒绝");
 
     // 群未启用：消息不转发
-    send_json(&up, group_message(100, BOT_ID.parse().unwrap(), "hello"));
+    send_json(&up, group_message(100, 123, "hello"));
     expect_no_bot_message(&mut bot, Duration::from_millis(400)).await;
 
     // @bot /enable：superuser 指令，回包应带「已启用群聊」
-    let enable = json!({
-        "post_type": "message",
-        "message_type": "group",
-        "message_format": "array",
-        "message_id": 1002,
-        "user_id": BOT_ID.parse::<i64>().unwrap(),
-        "group_id": 100,
-        "raw_message": format!("[CQ:at,qq={}] /enable", BOT_ID),
-        "message": [
-            {"type": "at", "data": {"qq": BOT_ID}},
-            {"type": "text", "data": {"text": "/enable"}}
-        ],
-    });
-    send_json(&up, enable);
-    let reply = recv_action(&mut up, "send_group_msg").await;
-    assert!(reply.to_string().contains("已启用群聊"), "reply = {reply}");
+    send_json(&up, at_command(100, 123456789, "/enable"));
+    let reply = recv_reply_text(&mut up).await;
+    assert!(reply.contains("已启用群聊"), "reply = {reply}");
 
     // 群已启用，消息应转发给 bot
-    send_json(&up, group_message(100, BOT_ID.parse().unwrap(), "hello"));
-    let forwarded = timeout(Duration::from_secs(3), bot.rx.recv())
+    send_json(&up, group_message(100, 123, "hello"));
+    let forwarded = recv_bot_message(&mut bot, Duration::from_secs(3))
         .await
-        .expect("bot 应收到转发消息")
-        .expect("channel");
-    let v: Value = match forwarded {
-        Message::Text(t) => serde_json::from_str(t.as_str()).unwrap(),
-        other => panic!("意外消息: {:?}", other),
-    };
-    assert_eq!(v["message"][0]["data"]["text"], "hello");
+        .expect("bot 应收到转发消息");
+    assert_eq!(forwarded["message"][0]["data"]["text"], "hello");
 
     // /bot status 与 /bot 列表
-    send_json(
-        &up,
-        group_message(100, BOT_ID.parse().unwrap(), "/bot status"),
-    );
-    let status = recv_action(&mut up, "send_group_msg").await;
-    let text = status.to_string();
-    assert!(text.contains("「OneBotFilter」"), "status = {text}");
-    assert!(text.contains("BOT-Apps"), "status = {text}");
-    send_json(&up, group_message(100, BOT_ID.parse().unwrap(), "/bot"));
-    let list = recv_action(&mut up, "send_group_msg").await;
-    assert!(list.to_string().contains("alpha"), "list = {list}");
+    send_json(&up, group_message(100, 123456789, "/bot status"));
+    let status = recv_reply_text(&mut up).await;
+    assert!(status.contains("「OneBotFilter」"), "status = {status}");
+    assert!(status.contains("BOT-Apps"), "status = {status}");
+    send_json(&up, group_message(100, 123456789, "/bot"));
+    let list = recv_reply_text(&mut up).await;
+    assert!(list.contains("alpha"), "list = {list}");
 }
 
 #[tokio::test]
 async fn filters_and_prefix_replace() {
     let (bot_uri, mut bot) = spawn_mock_bot().await;
-    let cfg = test_config(
-        &bot_uri,
-        MessageConfig {
-            mode: BLACKLIST.into(),
-            filters: vec!["^/".into()],
-            prefix: vec!["#".into()],
-            prefix_replace: "/".into(),
-        },
-        vec![],
-    );
-    let (app, addr) = spawn_gateway(cfg).await;
+    let mut cfg = base_config(&bot_uri);
+    cfg.bot_apps[0].message.group = MessageConfig {
+        mode: BLACKLIST.into(),
+        filters: vec!["^/".into()],
+        prefix: vec!["#".into()],
+        prefix_replace: "/".into(),
+    };
+    let (app, addr) = spawn_gateway(cfg, None).await;
     app.store.enable_group(100).unwrap();
     wait_for_client(&app, "alpha").await;
     let up = connect_upstream(addr).await;
@@ -350,23 +377,17 @@ async fn filters_and_prefix_replace() {
 
     // 未命中：转发
     send_json(&up, group_message(100, 111, "hello"));
-    let forwarded = timeout(Duration::from_secs(3), bot.rx.recv())
+    let forwarded = recv_bot_message(&mut bot, Duration::from_secs(3))
         .await
-        .expect("应转发")
-        .expect("channel");
-    assert!(forwarded.to_string().contains("hello"));
+        .expect("应转发");
+    assert_eq!(forwarded["message"][0]["data"]["text"], "hello");
 
     // 前缀命中：放行且前缀被替换
     send_json(&up, group_message(100, 111, "#help"));
-    let forwarded = timeout(Duration::from_secs(3), bot.rx.recv())
+    let forwarded = recv_bot_message(&mut bot, Duration::from_secs(3))
         .await
-        .expect("前缀消息应放行")
-        .expect("channel");
-    let v: Value = match forwarded {
-        Message::Text(t) => serde_json::from_str(t.as_str()).unwrap(),
-        other => panic!("意外消息: {:?}", other),
-    };
-    assert_eq!(v["message"][0]["data"]["text"], "/help");
+        .expect("前缀消息应放行");
+    assert_eq!(forwarded["message"][0]["data"]["text"], "/help");
 
     // 黑用户：直接丢弃
     app.store.add_black_user(222).unwrap();
@@ -377,18 +398,12 @@ async fn filters_and_prefix_replace() {
 #[tokio::test]
 async fn rewrite_scrubs_echo_and_drops_self_report() {
     let (bot_uri, mut bot) = spawn_mock_bot().await;
-    let cfg = test_config(
-        &bot_uri,
-        MessageConfig {
-            mode: ON.into(),
-            ..Default::default()
-        },
-        vec![RewriteTextRule {
-            original: r"v[0-9]+\.[0-9]+\.[0-9]+".into(),
-            replace: "v1.0.0".into(),
-        }],
-    );
-    let (app, addr) = spawn_gateway(cfg).await;
+    let mut cfg = base_config(&bot_uri);
+    cfg.bot_apps[0].rewrite_text = vec![RewriteTextRule {
+        original: r"v[0-9]+\.[0-9]+\.[0-9]+".into(),
+        replace: "v1.0.0".into(),
+    }];
+    let (app, addr) = spawn_gateway(cfg, None).await;
     app.store.enable_group(100).unwrap();
     wait_for_client(&app, "alpha").await;
     let mut up = connect_upstream(addr).await;
@@ -416,16 +431,14 @@ async fn rewrite_scrubs_echo_and_drops_self_report() {
             "echo": "bot-echo",
         }),
     );
-    let resp = timeout(Duration::from_secs(3), bot.rx.recv())
+    let resp = recv_bot_message(&mut bot, Duration::from_secs(3))
         .await
-        .expect("bot 应收到回包")
-        .expect("channel");
-    let v: Value = match resp {
-        Message::Text(t) => serde_json::from_str(t.as_str()).unwrap(),
-        other => panic!("意外消息: {:?}", other),
-    };
-    assert_eq!(v["data"]["message_id"], 777);
-    assert!(v["data"].get("message").is_none(), "正文应被抹除: {v}");
+        .expect("bot 应收到回包");
+    assert_eq!(resp["data"]["message_id"], 777);
+    assert!(
+        resp["data"].get("message").is_none(),
+        "正文应被抹除: {resp}"
+    );
 
     // 改写后的自身上报应被丢弃（上游不再收到）
     send_json(
@@ -435,12 +448,173 @@ async fn rewrite_scrubs_echo_and_drops_self_report() {
             "message_type": "group",
             "message_format": "array",
             "message_id": 777,
-            "self_id": BOT_ID.parse::<i64>().unwrap(),
-            "user_id": BOT_ID.parse::<i64>().unwrap(),
+            "self_id": 123456789,
+            "user_id": 123456789,
             "group_id": 100,
             "raw_message": "客户端 v1.0.0",
             "message": [{"type": "text", "data": {"text": "客户端 v1.0.0"}}],
         }),
     );
-    expect_no_action(&mut up, "send_group_msg", Duration::from_millis(600)).await;
+    if let Ok(Some(v)) = timeout(Duration::from_millis(600), up.rx.recv()).await {
+        panic!("自身上报不应再转发: {v}");
+    }
+}
+
+#[tokio::test]
+async fn private_messages_require_global_enable_and_list() {
+    let (bot_uri, mut bot) = spawn_mock_bot().await;
+    let cfg = base_config(&bot_uri);
+    let (app, addr) = spawn_gateway(cfg, None).await;
+    wait_for_client(&app, "alpha").await;
+    let mut up = connect_upstream(addr).await;
+    let user: i64 = 123456789;
+
+    // 默认：私聊用户不在全局白名单，不转发
+    send_json(&up, private_message(user, "hi"));
+    expect_no_bot_message(&mut bot, Duration::from_millis(400)).await;
+
+    // @bot /enable <qq> private：全局私聊白名单
+    send_json(
+        &up,
+        at_command(100, user, &format!("/enable {} private", user)),
+    );
+    let reply = recv_reply_text(&mut up).await;
+    assert!(reply.contains("已启用私聊用户"), "reply = {reply}");
+
+    // 全局白名单通过，但 per-bot 私聊名单是 whitelist 且为空 → 仍不转发
+    send_json(&up, private_message(user, "hi"));
+    expect_no_bot_message(&mut bot, Duration::from_millis(400)).await;
+
+    // /alpha on <qq> private：per-bot 私聊名单
+    send_json(
+        &up,
+        group_message(100, user, &format!("/alpha on {} private", user)),
+    );
+    let reply = recv_reply_text(&mut up).await;
+    assert!(reply.contains("已允许"), "reply = {reply}");
+
+    // 现在应转发
+    send_json(&up, private_message(user, "hi"));
+    let forwarded = recv_bot_message(&mut bot, Duration::from_secs(3))
+        .await
+        .expect("私聊应转发");
+    assert_eq!(forwarded["message"][0]["data"]["text"], "hi");
+
+    // /disable <qq> private 关闭全局白名单后不再转发
+    send_json(
+        &up,
+        at_command(100, user, &format!("/disable {} private", user)),
+    );
+    let reply = recv_reply_text(&mut up).await;
+    assert!(reply.contains("已禁用私聊用户"), "reply = {reply}");
+    send_json(&up, private_message(user, "hi"));
+    expect_no_bot_message(&mut bot, Duration::from_millis(400)).await;
+}
+
+#[tokio::test]
+async fn private_message_filter_and_black_user() {
+    let (bot_uri, mut bot) = spawn_mock_bot().await;
+    let mut cfg = base_config(&bot_uri);
+    cfg.bot_apps[0].message.private = MessageConfig {
+        mode: BLACKLIST.into(),
+        filters: vec!["^secret".into()],
+        ..Default::default()
+    };
+    let (app, addr) = spawn_gateway(cfg, None).await;
+    app.store.enable_private_user(123456789).unwrap();
+    app.store
+        .set_bot_private_user("alpha", WHITELIST, 123456789, true)
+        .unwrap();
+    wait_for_client(&app, "alpha").await;
+    let up = connect_upstream(addr).await;
+
+    // 命中私聊内容黑名单：不转发
+    send_json(&up, private_message(123456789, "secret 内容"));
+    expect_no_bot_message(&mut bot, Duration::from_millis(400)).await;
+
+    // 未命中：转发
+    send_json(&up, private_message(123456789, "hello"));
+    let forwarded = recv_bot_message(&mut bot, Duration::from_secs(3))
+        .await
+        .expect("私聊应转发");
+    assert_eq!(forwarded["message"][0]["data"]["text"], "hello");
+
+    // 全局黑用户优先：即使白名单/名单都通过也不转发
+    app.store.add_black_user(123456789).unwrap();
+    send_json(&up, private_message(123456789, "hello"));
+    expect_no_bot_message(&mut bot, Duration::from_millis(400)).await;
+}
+
+#[tokio::test]
+async fn private_queries_and_commands() {
+    let (bot_uri, mut bot) = spawn_mock_bot().await;
+    let cfg = base_config(&bot_uri);
+    let (app, addr) = spawn_gateway(cfg, None).await;
+    app.store.enable_private_user(123456789).unwrap();
+    wait_for_client(&app, "alpha").await;
+    let mut up = connect_upstream(addr).await;
+
+    // /group status private
+    send_json(&up, group_message(100, 123456789, "/group status private"));
+    let text = recv_reply_text(&mut up).await;
+    assert!(text.contains("已启用的私聊用户"), "text = {text}");
+    assert!(text.contains("123456789"), "text = {text}");
+
+    // /group alpha private
+    send_json(&up, group_message(100, 123456789, "/group alpha private"));
+    let text = recv_reply_text(&mut up).await;
+    assert!(text.contains("私聊"), "text = {text}");
+    assert!(text.contains("名单模式"), "text = {text}");
+
+    // 非 superuser 执行管理指令：静默
+    send_json(&up, group_message(100, 999, "/alpha on 123456789 private"));
+    if let Ok(Some(v)) = timeout(Duration::from_millis(400), up.rx.recv()).await {
+        panic!("非 superuser 不应收到指令回复: {v}");
+    }
+    let _ = &mut bot;
+}
+
+#[tokio::test]
+async fn prunes_stale_runtime_state() {
+    let (bot_uri, _bot) = spawn_mock_bot().await;
+    // 初始 db 里塞入不存在的群 / bot 群名单 / 群名
+    let initial_db = r#"{
+        "enabled_groups": [100, 999],
+        "enabled_private_users": [],
+        "black_users": [42],
+        "bots": {"alpha": {"groups": [999], "users": []}},
+        "group_names": {"999": "旧群"},
+        "joined_groups": [100, 999]
+    }"#;
+    let cfg = base_config(&bot_uri);
+    let (app, addr) = spawn_gateway(cfg, Some(initial_db)).await;
+    wait_for_client(&app, "alpha").await;
+    let _up = connect_upstream(addr).await;
+    // 上游连接 500ms 后会拉 get_group_list（mock 返回 [100]）
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    assert!(app.store.is_group_enabled(100), "存在的群应保留启用状态");
+    assert!(!app.store.is_group_enabled(999), "不存在的群应被清理");
+    assert!(
+        app.store.snapshot_bot_groups("alpha").is_empty(),
+        "bot 群名单应被清理"
+    );
+    assert_eq!(app.store.get_group_name(999), "", "旧群名应被清理");
+    assert!(app.store.is_black_user(42), "全局黑用户不应被清理");
+}
+
+#[tokio::test]
+async fn rejects_concurrent_second_upstream() {
+    let (bot_uri, _bot) = spawn_mock_bot().await;
+    let cfg = base_config(&bot_uri);
+    let (_app, addr) = spawn_gateway(cfg, None).await;
+    wait_for_client(&_app, "alpha").await;
+
+    let url = format!("ws://{}/ws", addr);
+    let (a, b) = tokio::join!(
+        tokio_tungstenite::connect_async(url.clone()),
+        tokio_tungstenite::connect_async(url)
+    );
+    let ok_count = [&a, &b].iter().filter(|r| r.is_ok()).count();
+    assert_eq!(ok_count, 1, "并发连接应恰好成功一个");
 }

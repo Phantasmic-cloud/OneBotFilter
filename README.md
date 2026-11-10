@@ -3,14 +3,16 @@
 [中文文档](./docs/README_zh.md) | English
 
 A WebSocket filtering gateway for OneBot v11: one OneBot implementation connects in,
-multiple bot applications connect out, and group messages reach a bot only after
-passing a per-group switch, a blacklist check, that bot's group list and its content
-filters.
+multiple bot applications connect out, and messages reach a bot only after passing
+global switches and per-bot allow lists.
 
-- Pure Rust, no CGO: a single static binary
+- Pure Rust, no CGO: a single static-ish binary
 - Reverse WebSocket on both sides (server towards the OneBot implementation, client towards bot apps)
-- Group switches, black users and per-bot group lists are runtime state, editable from chat and persisted to `db.json`
+- **Group and private chat both supported**: group switches + per-bot group lists for groups;
+  a global private-user whitelist + per-bot private-user lists for direct messages
+- Per-bot content filters (prefix / whitelist / blacklist) configured separately for group and private messages
 - Outbound text can be rewritten with regex rules; rewritten echoes are scrubbed from API responses
+- Runtime state (switches, lists, caches) lives in `db.json`; stale bot/group state is pruned automatically
 
 ## Quick start
 
@@ -42,24 +44,27 @@ src/
   main.rs            entry point
   lib.rs             startup wiring: config, state, listener, clients, hot reload
   global.rs          shared App state, connections, counters, filter registry
-  config.rs          config, validation, hot reload
-  onebot_message.rs  event parsing, @me, command text
-  stats.rs           send-like API detection
-  store.rs           db.json runtime state
-  api.rs             echo-correlated OneBot API calls
-  filters.rs         content filters (prefix / whitelist / blacklist)
+  config.rs          config (mode.group/private, message.group/private), validation, hot reload
+  message.rs         shared message segment / outbound message model
+  onebot_api.rs      typed OneBot actions, echo correlation, response parsing
+  gate.rs            shared group/private gating
+  store.rs           db.json state: switches, allow lists, caches, pruning
+  api.rs             high-level API: group names, group list, latency
+  onebot_message.rs  inbound event parsing, @me, command text
+  filters.rs         content filters (group and private configs)
   rewrite.rs         outbound text rewriting and echo scrubbing
   command.rs         built-in chat commands and status text
-  dispatch.rs        inbound dispatch and gating
+  dispatch.rs        inbound dispatch and delivery
   server.rs          upstream OneBot connection (single)
   client.rs          downstream bot connections, reconnect, latency probe
 tests/gateway.rs     end-to-end integration tests
 docs/README_zh.md    full Chinese guide
-AGENTS.md            architecture and API notes
+docs/API.md          protocol, config and internal API reference
+AGENTS.md            architecture and contribution notes
 ```
 
 Configuration, the command list and the gating order are documented in
-[`AGENTS.md`](./AGENTS.md) and the [Chinese guide](./docs/README_zh.md).
+[`docs/API.md`](./docs/API.md) and [`AGENTS.md`](./AGENTS.md).
 
 ## License
 

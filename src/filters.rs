@@ -1,4 +1,7 @@
-//! 内容过滤：mode / prefix / 正则（对应 Go 版 `filters.go`）。
+//! 内容过滤：mode / prefix / 正则。
+//!
+//! `Filter::filter_content` 根据消息类型自动选择 `message.group` 或 `message.private`，
+//! 返回 `FilterDecision { allowed, modified }`，让 dispatch 可以在未改写时直接透传原始字节。
 
 use std::fmt;
 
@@ -11,6 +14,36 @@ use crate::global::{
 };
 use crate::onebot_message::OneBotMessage;
 use crate::rewrite::{compile_rewrite_rules, CompiledRewrite};
+
+/// 内容过滤结果：`modified` 表示消息内容被改过（prefix-replace），需要重新序列化。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilterDecision {
+    pub allowed: bool,
+    pub modified: bool,
+}
+
+impl FilterDecision {
+    pub fn pass() -> Self {
+        Self {
+            allowed: true,
+            modified: false,
+        }
+    }
+
+    pub fn pass_modified() -> Self {
+        Self {
+            allowed: true,
+            modified: true,
+        }
+    }
+
+    pub fn deny() -> Self {
+        Self {
+            allowed: false,
+            modified: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct MessageFilter {
@@ -37,61 +70,68 @@ impl Filter {
 
     pub fn compile(&mut self, cfg: &BotAppsConfig) {
         self.name = cfg.name.clone();
-        self.group_mode = cfg.group_id.mode.clone();
-        self.private_message.compile(&cfg.private_message);
-        self.group_message.compile(&cfg.group_message);
+        self.group_mode = cfg.mode.group.clone();
+        self.private_message.compile(&cfg.message.private);
+        self.group_message.compile(&cfg.message.group);
         self.rewrite = compile_rewrite_rules(&cfg.rewrite_text);
     }
 
-    /// 仅做内容过滤（前缀/正则）。名单与群开关由 dispatch 处理。
-    pub fn filter_content(&self, msg: &mut OneBotMessage) -> bool {
-        let debug = crate::global::try_global()
-            .map(|app| app.config().server.debug)
-            .unwrap_or(false);
-
+    /// 仅做内容过滤（前缀/正则）。名单与全局开关由 gate 处理。
+    pub fn filter_content(&self, msg: &mut OneBotMessage, debug: bool) -> FilterDecision {
         let used_filter = match msg.partial.message_type.as_str() {
             GROUP => &self.group_message,
             PRIVATE => &self.private_message,
-            _ => return true,
+            _ => return FilterDecision::pass(),
         };
 
         if used_filter.config.mode.is_empty() || used_filter.config.mode == ON {
             if debug {
                 log::info!("{}：直接通过的消息：{}", self.name, msg.partial.raw_message);
             }
-            return true;
+            return FilterDecision::pass();
         }
         if used_filter.config.mode == OFF {
             if debug {
                 log::info!("{}：被禁止的消息：{}", self.name, msg.partial.raw_message);
             }
-            return false;
+            return FilterDecision::deny();
         }
         if used_filter.prefix_pass(msg) {
-            log::info!("{}：前缀通过的消息：{}", self.name, msg.partial.raw_message);
-            return true;
+            if debug {
+                log::info!("{}：前缀通过的消息：{}", self.name, msg.partial.raw_message);
+            }
+            return FilterDecision::pass_modified();
         }
         if msg.partial.message_format == MESSAGE_FORMAT_ARRAY {
             for seg in &msg.partial.message_array {
-                if seg.r#type != MESSAGE_TYPE_TEXT {
+                if seg.ty != MESSAGE_TYPE_TEXT {
                     continue;
                 }
                 let text = match seg.data.get("text").and_then(|v| v.as_str()) {
                     Some(t) => t.trim().to_string(),
                     None => continue,
                 };
-                if let Some(result) =
-                    used_filter.process_filter(&self.name, &text, &msg.partial.raw_message)
+                if let Some(allowed) =
+                    used_filter.process_filter(&self.name, &text, &msg.partial.raw_message, debug)
                 {
-                    return result;
+                    return if allowed {
+                        FilterDecision::pass()
+                    } else {
+                        FilterDecision::deny()
+                    };
                 }
             }
-        } else if let Some(result) = used_filter.process_filter(
+        } else if let Some(allowed) = used_filter.process_filter(
             &self.name,
             msg.partial.message_string.trim(),
             &msg.partial.raw_message,
+            debug,
         ) {
-            return result;
+            return if allowed {
+                FilterDecision::pass()
+            } else {
+                FilterDecision::deny()
+            };
         }
 
         match used_filter.config.mode.as_str() {
@@ -103,7 +143,7 @@ impl Filter {
                         msg.partial.raw_message
                     );
                 }
-                false
+                FilterDecision::deny()
             }
             BLACKLIST => {
                 if debug {
@@ -113,14 +153,14 @@ impl Filter {
                         msg.partial.raw_message
                     );
                 }
-                true
+                FilterDecision::pass()
             }
             _ => {
                 log::error!(
                     "{}的message.mode配置异常，必须为whitelist或blacklist",
                     self.name
                 );
-                false
+                FilterDecision::deny()
             }
         }
     }
@@ -149,7 +189,7 @@ impl MessageFilter {
             MESSAGE_FORMAT_ARRAY => {
                 let mut found = None;
                 for (i, seg) in msg.partial.message_array.iter().enumerate() {
-                    if seg.r#type != MESSAGE_TYPE_TEXT {
+                    if seg.ty != MESSAGE_TYPE_TEXT {
                         continue;
                     }
                     if let Some(t) = seg.data.get("text").and_then(|v| v.as_str()) {
@@ -223,16 +263,26 @@ impl MessageFilter {
         true
     }
 
-    pub fn process_filter(&self, name: &str, text: &str, raw_message: &str) -> Option<bool> {
+    pub fn process_filter(
+        &self,
+        name: &str,
+        text: &str,
+        raw_message: &str,
+        debug: bool,
+    ) -> Option<bool> {
         for pattern in &self.regexps {
             match pattern.is_match(text) {
                 Ok(true) => match self.config.mode.as_str() {
                     WHITELIST => {
-                        log::info!("{}：白名单的消息：{}", name, raw_message);
+                        if debug {
+                            log::info!("{}：白名单的消息：{}", name, raw_message);
+                        }
                         return Some(true);
                     }
                     BLACKLIST => {
-                        log::info!("{}：黑名单的消息：{}", name, raw_message);
+                        if debug {
+                            log::info!("{}：黑名单的消息：{}", name, raw_message);
+                        }
                         return Some(false);
                     }
                     _ => {}
@@ -254,7 +304,7 @@ impl fmt::Display for Filter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "\nname: {}\ngroup-id.mode: {}\nprivate-message: {}\n\tfilters: [ {} ]\n\tprefix: [ {} ], replace: {}\ngroup-message: {}\n\tfilters: [ {} ]\n\tprefix: [ {} ], replace: {}",
+            "\nname: {}\nmode.group: {}\nprivate-message: {}\n\tfilters: [ {} ]\n\tprefix: [ {} ], replace: {}\ngroup-message: {}\n\tfilters: [ {} ]\n\tprefix: [ {} ], replace: {}",
             self.name,
             self.group_mode,
             self.private_message.config.mode,
@@ -272,25 +322,28 @@ impl fmt::Display for Filter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BotAppsConfig, GroupIdConfig, MessageConfig};
+    use crate::config::{BotAppsConfig, BotMessageConfig, MessageConfig, ModeConfig};
     use crate::onebot_message::parse;
 
-    fn compile(cfg: BotAppsConfig) -> Filter {
-        let mut cfg = cfg;
+    fn compile(mut cfg: BotAppsConfig) -> Filter {
         cfg.check().unwrap();
         let mut f = Filter::new(&cfg.name);
         f.compile(&cfg);
         f
     }
 
-    fn bot_with_message(message: MessageConfig) -> BotAppsConfig {
+    fn bot_with_group_message(message: MessageConfig) -> BotAppsConfig {
         BotAppsConfig {
             name: "alpha".into(),
             uri: "ws://127.0.0.1:8080/onebot/v11/ws".into(),
-            group_id: GroupIdConfig {
-                mode: BLACKLIST.into(),
+            mode: ModeConfig {
+                group: BLACKLIST.into(),
+                private: WHITELIST.into(),
             },
-            message,
+            message: BotMessageConfig {
+                group: message,
+                private: MessageConfig::default(),
+            },
             ..Default::default()
         }
     }
@@ -298,6 +351,14 @@ mod tests {
     fn group_text_message(text: &str) -> crate::onebot_message::OneBotMessage {
         let raw = format!(
             r#"{{"post_type":"message","message_type":"group","message_format":"array","message":[{{"type":"text","data":{{"text":"{}"}}}}],"raw_message":"{}"}}"#,
+            text, text
+        );
+        parse(raw.as_bytes()).unwrap()
+    }
+
+    fn private_text_message(text: &str) -> crate::onebot_message::OneBotMessage {
+        let raw = format!(
+            r#"{{"post_type":"message","message_type":"private","message_format":"array","message":[{{"type":"text","data":{{"text":"{}"}}}}],"raw_message":"{}"}}"#,
             text, text
         );
         parse(raw.as_bytes()).unwrap()
@@ -360,22 +421,26 @@ mod tests {
             ),
         ];
         for (message, text, want) in cases {
-            let f = compile(bot_with_message(message));
+            let f = compile(bot_with_group_message(message));
             let mut msg = group_text_message(text);
-            assert_eq!(f.filter_content(&mut msg), want, "text={text}");
+            let decision = f.filter_content(&mut msg, false);
+            assert_eq!(decision.allowed, want, "text={text}");
+            assert!(!decision.modified, "未改写的消息不应标记 modified");
         }
     }
 
     #[test]
     fn prefix_pass_rewrites() {
-        let f = compile(bot_with_message(MessageConfig {
+        let f = compile(bot_with_group_message(MessageConfig {
             mode: BLACKLIST.into(),
             filters: vec!["^never-match".into()],
             prefix: vec!["#".into()],
             prefix_replace: "/".into(),
         }));
         let mut msg = group_text_message("#help");
-        assert!(f.filter_content(&mut msg));
+        let decision = f.filter_content(&mut msg, false);
+        assert!(decision.allowed);
+        assert!(decision.modified);
         assert_eq!(
             msg.partial.message_array[0].data.get("text").unwrap(),
             &serde_json::Value::String("/help".into())
@@ -384,13 +449,20 @@ mod tests {
     }
 
     #[test]
-    fn private_message_inherits() {
-        let mut cfg = bot_with_message(MessageConfig {
-            mode: OFF.into(),
+    fn private_uses_private_message_config() {
+        let mut bot = bot_with_group_message(MessageConfig {
+            mode: ON.into(),
             ..Default::default()
         });
-        cfg.check().unwrap();
-        assert_eq!(cfg.private_message.mode, OFF);
-        assert_eq!(cfg.group_message.mode, OFF);
+        bot.message.private = MessageConfig {
+            mode: BLACKLIST.into(),
+            filters: vec!["^secret".into()],
+            ..Default::default()
+        };
+        let f = compile(bot);
+        let mut allowed = private_text_message("hello");
+        assert!(f.filter_content(&mut allowed, false).allowed);
+        let mut blocked = private_text_message("secret");
+        assert!(!f.filter_content(&mut blocked, false).allowed);
     }
 }

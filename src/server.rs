@@ -55,7 +55,7 @@ async fn handle_connection(app: Arc<App>, stream: tokio::net::TcpStream) {
                     "404 page not found\n",
                 ));
             }
-            if app_cb.upstream.read().tx.is_some() {
+            if !app_cb.try_acquire_upstream() {
                 return Err(error_response(
                     StatusCode::FORBIDDEN,
                     "只能连接一个OneBot客户端\n",
@@ -69,8 +69,11 @@ async fn handle_connection(app: Arc<App>, stream: tokio::net::TcpStream) {
 
     let ws = match attach {
         Ok(w) => w,
-        // 被拒绝的连接（403/404）与 Go 版一样安静返回
-        Err(_) => return,
+        Err(_) => {
+            // 被拒绝（403/404）或握手失败：释放占坑
+            app.release_upstream();
+            return;
+        }
     };
     log::info!("已连接到OneBot客户端");
 
@@ -147,5 +150,6 @@ async fn handle_connection(app: Arc<App>, stream: tokio::net::TcpStream) {
         upstream.pending.clear();
     }
     app.reset_onebot_traffic();
+    app.release_upstream();
     log::info!("OneBot客户端连接已断开");
 }

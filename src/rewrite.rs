@@ -9,6 +9,7 @@ use serde_json::{json, Map, Value};
 use crate::config::RewriteTextRule;
 use crate::filters::Filter;
 use crate::global::App;
+use crate::message::OutboundMessage;
 use crate::onebot_message::{MessageContent, OneBotMessage};
 
 pub const REWRITE_TTL: Duration = Duration::from_secs(90);
@@ -96,49 +97,47 @@ impl Filter {
 }
 
 fn rewrite_message_field(msg: &Value, rules: &[CompiledRewrite]) -> Option<(Value, Vec<String>)> {
-    if msg.is_null() {
-        return None;
-    }
-    if msg.is_array() {
-        let mut segs: Vec<MessageContent> = serde_json::from_value(msg.clone()).ok()?;
-        let mut changed = false;
-        let mut texts: Vec<String> = Vec::new();
-        for seg in segs.iter_mut() {
-            if seg.r#type != crate::global::MESSAGE_TYPE_TEXT || seg.data.is_empty() {
-                continue;
+    let message = OutboundMessage::from_json(msg)?;
+    match message {
+        OutboundMessage::Segments(mut segs) => {
+            let mut changed = false;
+            let mut texts: Vec<String> = Vec::new();
+            for seg in segs.iter_mut() {
+                if seg.ty != crate::global::MESSAGE_TYPE_TEXT || seg.data.is_empty() {
+                    continue;
+                }
+                let t = match seg.data.get("text").and_then(|v| v.as_str()) {
+                    Some(t) => t.to_string(),
+                    None => continue,
+                };
+                let (nt, ok) = apply_rewrite_rules(&t, rules);
+                let t = if ok {
+                    seg.data
+                        .insert("text".to_string(), Value::String(nt.clone()));
+                    changed = true;
+                    nt
+                } else {
+                    t
+                };
+                if !t.is_empty() {
+                    texts.push(t);
+                }
             }
-            let t = match seg.data.get("text").and_then(|v| v.as_str()) {
-                Some(t) => t.to_string(),
-                None => continue,
-            };
-            let (mut t, mut this_changed) = (t, false);
-            let (nt, ok) = apply_rewrite_rules(&t, rules);
-            if ok {
-                seg.data
-                    .insert("text".to_string(), Value::String(nt.clone()));
-                changed = true;
-                this_changed = true;
-                t = nt;
+            if !changed {
+                return None;
             }
-            let _ = this_changed;
-            if !t.is_empty() {
-                texts.push(t);
-            }
+            let value = serde_json::to_value(&segs).ok()?;
+            let concat = texts.join("");
+            Some((value, rewrite_fingerprints(&concat, "")))
         }
-        if !changed {
-            return None;
+        OutboundMessage::Text(s) => {
+            let (ns, ok) = apply_rewrite_rules(&s, rules);
+            if !ok {
+                return None;
+            }
+            Some((Value::String(ns.clone()), rewrite_fingerprints(&ns, "")))
         }
-        let value = serde_json::to_value(&segs).ok()?;
-        let concat = texts.join("");
-        return Some((value, rewrite_fingerprints(&concat, "")));
     }
-
-    let s = msg.as_str()?;
-    let (ns, ok) = apply_rewrite_rules(s, rules);
-    if !ok {
-        return None;
-    }
-    Some((Value::String(ns.clone()), rewrite_fingerprints(&ns, "")))
 }
 
 fn remember_rewrite(app: &App, bot_name: &str, echo: &str, fps: &[String]) {
@@ -320,7 +319,7 @@ pub fn looks_like_api_response(raw: &[u8]) -> bool {
 fn event_fingerprints(msg: &OneBotMessage) -> Vec<String> {
     let mut texts: Vec<String> = Vec::new();
     for seg in &msg.partial.message_array {
-        if seg.r#type != crate::global::MESSAGE_TYPE_TEXT || seg.data.is_empty() {
+        if seg.ty != crate::global::MESSAGE_TYPE_TEXT || seg.data.is_empty() {
             continue;
         }
         if let Some(t) = seg.data.get("text").and_then(|v| v.as_str()) {
@@ -363,7 +362,7 @@ fn fingerprints_from_message_raw(msg_raw: &Value) -> Vec<String> {
         };
         let mut texts: Vec<String> = Vec::new();
         for seg in &segs {
-            if seg.r#type != crate::global::MESSAGE_TYPE_TEXT || seg.data.is_empty() {
+            if seg.ty != crate::global::MESSAGE_TYPE_TEXT || seg.data.is_empty() {
                 continue;
             }
             if let Some(t) = seg.data.get("text").and_then(|v| v.as_str()) {
@@ -434,8 +433,9 @@ fn json_raw_to_string(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use crate::config::{BotAppsConfig, GroupIdConfig, RewriteTextRule};
+    use crate::config::{
+        BotAppsConfig, BotMessageConfig, Config, MessageConfig, ModeConfig, RewriteTextRule,
+    };
     use crate::global::App;
     use crate::onebot_message::parse;
     use crate::store::Store;
@@ -463,8 +463,13 @@ mod tests {
         let mut cfg = BotAppsConfig {
             name: "alpha".into(),
             uri: "ws://127.0.0.1:8080/onebot/v11/ws".into(),
-            group_id: GroupIdConfig {
-                mode: crate::global::BLACKLIST.into(),
+            mode: ModeConfig {
+                group: crate::global::BLACKLIST.into(),
+                private: crate::global::WHITELIST.into(),
+            },
+            message: BotMessageConfig {
+                group: MessageConfig::default(),
+                private: MessageConfig::default(),
             },
             rewrite_text: rules,
             ..Default::default()

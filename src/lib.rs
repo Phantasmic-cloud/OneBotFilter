@@ -9,12 +9,14 @@ pub mod command;
 pub mod config;
 pub mod dispatch;
 pub mod filters;
+pub mod gate;
 pub mod global;
 pub mod logging;
+pub mod message;
+pub mod onebot_api;
 pub mod onebot_message;
 pub mod rewrite;
 pub mod server;
-pub mod stats;
 pub mod store;
 
 use std::sync::Arc;

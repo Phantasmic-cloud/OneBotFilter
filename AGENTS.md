@@ -16,11 +16,11 @@ OneBotFilter 是 OneBot v11 的 WebSocket 消息过滤网关。它同时扮演�
 - 对**下游 bot 应用**是**服务端**：本程序按 `bot-apps[].uri` 主动连出去（反向 WebSocket，
   与 NoneBot 等框架的 reverse-ws 接入方式一致）。
 
-群消息从上游进来后，按「群开关 → 黑用户 → bot 群名单 → 内容过滤」逐层过闸，再分发给
+群聊和私聊各有一套“全局开关 → 全局黑用户 → per-bot 名单 → 内容过滤”的链路，再分发给
 各 bot 应用；bot 的发言类 API 在出去前可以按正则改写文本，并把改写痕迹从回包里抹掉。
 
 纯 Rust、无 CGO（TLS 用 rustls），产物是单文件二进制；运行时状态落盘到 `db.json`，
-配置改动可热加载。
+配置改动可热加载，无用的 bot/群状态会自动清理。
 
 ## 仓库结构
 
@@ -29,17 +29,19 @@ Cargo.toml / Cargo.lock   依赖与锁定版本（二进制项目，Cargo.lock �
 src/
   main.rs                 入口：建 tokio runtime，调用 lib::run("config.yaml")
   lib.rs                  run()：加载配置/状态、监听上游、起各 bot 客户端、配置热更
-  global.rs               常量、App 共享状态（配置/连接/统计/过滤器注册）、读写锁封装
-  config.rs               配置结构（serde）、默认值、校验、notify 热更
+  global.rs               常量、App 共享状态、连接/统计/过滤器注册、上游唯一连接位
+  config.rs               配置结构（mode.group/private、message.group/private）、校验、旧字段检测、热更
   onebot_message.rs       事件宽松解析、@我判断、指令文本提取、CQ at 处理
-  stats.rs                发言类 API 判定
-  store.rs                db.json 运行时状态：群开关、黑用户、bot 名单、群名缓存
-  api.rs                  echo 关联的同步 OneBot API、群名/群列表缓存
+  message.rs              统一消息段 Segment / 出站 OutboundMessage（字符串或数组）
+  onebot_api.rs           统一 OneBot API：typed action、echo 关联、回包解析、发送类判定
+  gate.rs                 群/私聊统一闸门：ChatKind、全局开关、黑用户、per-bot 名单
+  store.rs                db.json 运行时状态：全局开关、双名单、黑用户、群名缓存、清理
+  api.rs                  高层 API：群名解析、群列表刷新、延迟测量
   filters.rs              内容过滤：mode、prefix 放行与替换、fancy-regex 正则
   rewrite.rs              出站文本改写、echo/message_id/指纹记录、回包正文抹除、自上报识别
-  command.rs              内置指令（/enable /disable /bu /bot /group /<bot> on|off）与状态文案
-  dispatch.rs             入站总入口：API 回包分流、自身上报丢弃、指令、黑用户、群开关、按 bot 分发
-  server.rs               上游 OneBot 连接（WS 服务端，只允许一个），读循环与分发
+  command.rs              内置指令（含 private 参数形态）与状态文案
+  dispatch.rs             入站总入口：API 回包分流、自身上报丢弃、群/私聊投递
+  server.rs               上游 OneBot 连接（WS 服务端，只允许一个，CAS 占位）
   client.rs               下游 bot 连接（WS 客户端）、重连、ping 延迟探测、连接统计
 tests/
   gateway.rs              进程内端到端集成测试（mock 上游 + mock bot）
@@ -47,6 +49,7 @@ tests/
 config-example.yaml       配置示例（只含占位值）
 scripts/build.sh          跨平台 release 构建（产物 dist/）
 docs/README_zh.md         面向使用者的中文说明
+docs/API.md               协议、配置、db 与内部 API 参考
 .github/workflows/build.yml  CI：fmt/clippy/test + 三平台构建；打 tag 时发 Release
 AGENTS.md                 本文件
 ```
@@ -57,7 +60,7 @@ AGENTS.md                 本文件
 
 | 连接 | 谁发起 | 代码 | 说明 |
 | --- | --- | --- | --- |
-| 上游 OneBot 实现 | 对方连本程序 | `server.rs` | 只有一个，第二个连接直接 403「只能连接一个OneBot客户端」 |
+| 上游 OneBot 实现 | 对方连本程序 | `server.rs` | 只有一个；第二个连接直接 403「只能连接一个OneBot客户端」 |
 | 下游 bot 应用 | 本程序连对方 | `client.rs` | 每个 `bot-apps[]` 一条，断线按 `sleep-time` / 5s 重连 |
 
 连 bot 应用时带的头：
@@ -69,58 +72,95 @@ user-agent: <server.user-agent>
 x-client-role: Universal
 ```
 
-断线重连语义是稳定行为约定：拨号失败等 `server.sleep-time` 秒再试；已经建连后读失败，
+断线重连语义是稳定约定：拨号失败等 `server.sleep-time` 秒再试；已经建连后读失败，
 固定等 5s 再重连。连接成功时复位该 bot 的流量计数；断开时标记 `DisconnectedAt` 并复位。
 
 ### 入站数据流
 
-`server.rs` 的读循环把帧交给 `dispatch::dispatch_incoming(app, is_text, raw)`，分四种情况：
+`server.rs` 的读循环把帧交给 `dispatch::dispatch_incoming(app, is_text, raw)`：
 
 1. 非文本帧 → 原样广播给所有 bot；
 2. 无 `post_type` 的 API 回包 → 本程序自己发起的（echo 以 `obf_` 开头）由
-   `api::try_deliver_api_response` 吃掉，不进 bot；其余广播给 bot，若属于被改写的发言，
+   `api::try_deliver_api_response` 吃掉；其余广播给 bot，若属于被改写的发言，
    正文会被 `rewrite::sanitize_rewritten_api_response` 剥掉；
 3. 改写后的自身上报（`message_sent`，或 self_id 等于自己的 message）→ 丢弃；
-4. 能解析的文本事件 → 有 `group_id` 的 `tokio::spawn(handle_group_event)`；
-   **无 `group_id` 的 message / notice / request（含私聊）一律丢弃**。
+4. `gate::classify` 认定为群/私聊 message 的：
+   - 群消息：spawn `handle_group_event`（先处理内置指令，再走闸门）；
+   - 私聊消息：直接 `handle_private_event`（无指令、不调 API）；
+5. 其它无群号事件（notice/request 等）一律丢弃；meta_event 等原样广播。
 
-`handle_group_event` 的判定顺序是硬性的，不要调换：
+### 群 / 私聊统一闸门（`gate.rs`）
 
 ```text
-内置指令 → 黑用户 → 群是否启用 → 该 bot 的群名单 → 该 bot 的内容过滤 → 写帧
+群消息：
+  内置指令（enable/disable 及其 private 形态不受群开关限制）
+  → 群是否启用（enabled_groups）
+  → 发送者是否全局黑用户（black_users）
+  → 每个 bot：mode.group 群名单 → message.group 内容过滤 → 转发
+
+私聊消息：
+  发送者是否在全局私聊白名单（enabled_private_users）
+  → 发送者是否全局黑用户
+  → 每个 bot：mode.private 私聊名单 → message.private 内容过滤 → 转发
 ```
 
-### 内容过滤语义
+`ChatKind::{Group, Private}`、`global_gate`、`bot_list_gate` 由两种会话共用；
+`dispatch::deliver_to_bots` 是唯一的转发循环，不要再写第二份。
 
-`bot-apps[].message`（以及覆盖它的 `private-message` / `group-message`）里的 `mode`：
+### 名单与开关
 
-| 值 | 行为 |
-| --- | --- |
-| `on` | 全放行 |
-| `off` | 全拦截 |
-| `whitelist` | 命中 `filters` 正则或带 `prefix` 才放行，否则拦截 |
-| `blacklist` | 命中 `filters` 正则或带 `prefix` 则拦截，否则放行 |
+- **全局开关**：
+  - `enabled_groups`：群是否 `/enable`（等价于“这个群允许用 BOT”）；
+  - `enabled_private_users`：用户是否 `/enable <qq> private`（私聊全局白名单，空=私聊全关）。
+- **per-bot 名单**（`db.json` 的 `bots[name].groups` / `users`）：
+  - `mode.group` = `whitelist` → 群在列表内才收；`blacklist` → 群在列表内拒收；
+  - `mode.private` = `whitelist` → 用户在列表内才收私聊；`blacklist` → 用户在列表内拒收。
+- **内容过滤**：`message.group` / `message.private` 各一份，`mode` 为
+  `on` / `off` / `whitelist` / `blacklist`，`prefix` 命中的消息会按 `prefix-replace` 改写前缀。
+- 修改名单只走 `Store` 方法（`set_bot_group` / `set_bot_private_user`），不要直接改 db.json。
 
-- `prefix` 命中的消息除了放行，还会把前缀替换成 `prefix-replace` 后再交给 bot
-  （`MessageFilter::prefix_pass`），同时改 `message` 与 `raw_message`，替换第一处。
-- `private-message` / `group-message` 的 `mode` 可以为 `default`，表示继承 `message`。
-  私聊事件目前不会进到这一步（无群号直接丢弃），这两项是预留结构。
-- 正则用 `fancy-regex`：兼容 lookahead/lookbehind 等常见扩展语法；`rewrite-text` 与
-  `filters` 里的规则都按它的语法写，改规则时注意测试。
+### 内置指令
 
-### bot 群名单
+只在**群消息**里生效，且要求 `server.command-prefix` 前缀。权限不足、群未启用、
+指令不存在时**静默返回**。私聊相关操作不新增顶层指令，而是在原指令后加 `private` 参数。
 
-`bot-apps[].group-id.mode` 与 `db.json` 里 `bots[<name>].ids` 配合：
+| 指令 | 权限 | 说明 |
+| --- | --- | --- |
+| `@bot /enable [群号]` / `@bot /disable [群号]` | superuser | 全局群开关 |
+| `@bot /enable <qq> private` / `@bot /disable <qq> private` | superuser | 全局私聊白名单增删 |
+| `/bu add\|del <qq>` / `/bu list` | superuser | 全局黑用户（群/私聊都生效） |
+| `/bot` / `/bot status` / `/bot <name>` | 无 | 列表 / 状态 / 详情 |
+| `/group status` / `/group <name>` | superuser | 群启用列表 / bot 群开关明细 |
+| `/group status private` | superuser | 全局私聊白名单 |
+| `/group <name> private` | superuser | 某 bot 私聊详情 |
+| `/<name> on\|off` | superuser | 当前群在该 bot 群名单中的开关 |
+| `/<name> on\|off <qq> private` | superuser | 该 bot 私聊名单开关 |
 
-- `whitelist`：`ids` 里的群才收该 bot 的消息；
-- `blacklist`：`ids` 里的群不收，其余都收。
+注意：
 
-改名单的入口是群指令 `/<bot> on|off`（写进 `store.rs` 的 `set_bot_group`），不要绕过它直接改 `db.json`。
+- `/enable`、`/disable` 必须 @bot 才被当作指令，没 @ 会原样放行给 bot；
+- 指令处理可能调用 OneBot API（比如解析群名），所以必须在独立 task 里跑
+  （`dispatch::handle_group_event` 已经是 spawn 出去的）：在读循环里同步等 API 回包会死锁；
+- `private` 形态的管理/查询不受当前群是否启用限制，但仍在群消息里执行；
+- 文案与格式（`✔◉ / ✔◎ / ✔⊗ / ✘⟳ / ¿⟳`、uptime、延迟、`%Y-%-m-%-d %H:%M:%S`）是稳定输出，
+  改文案算行为变更。
+
+### 统一消息模型与 OneBot API 层
+
+- `message.rs`：`Segment`（`type` + `data`）、`OutboundMessage`（`Text` / `Segments`）。
+  入站解析、出站回复、改写都复用这一套。
+- `onebot_api.rs`：
+  - `Action`（要回包）：`GetGroupInfo` / `GetGroupList` / `GetLoginInfo`；
+  - `SendAction`（发言类）：`SendGroupMsg` / `SendPrivateMsg`；
+  - `call`（echo 关联 + 超时 + 错误映射）、`enqueue_send`、`encode_send`、`new_echo`；
+  - `is_send_action` / `is_send_frame` 是发送类判定的唯一来源；
+  - `ApiError::NotConnected` 的 Display 保持旧文案「没有连接到OneBot客户端」。
+- 新加 OneBot 调用必须在这里加 typed struct，不要在业务模块手拼 `{"action": ...}`。
 
 ### 出站改写与回包抹除
 
 bot → 上游的「发言类」API（`send_msg`、`send_group_msg`、`send_private_msg`、
-`send_group_forward_msg` 等，判定见 `stats.rs` 的 `is_outbound_send_action`）会先过
+`send_group_forward_msg` 等，判定见 `onebot_api::is_send_action`）会先过
 `Filter::rewrite_outbound`，按 `rewrite-text` 规则顺序做正则替换，`message` 字段可能是
 字符串也可能是消息段数组（只改 `text` 段）。
 
@@ -132,41 +172,16 @@ bot → 上游的「发言类」API（`send_msg`、`send_group_msg`、`send_priv
 - bot 自己上报的 `message_sent` 按同一套记录丢弃（`is_rewritten_self_report`）。
 
 记录有效期 `REWRITE_TTL = 90s`，读写时顺带清理过期项。给新的发言类 action 加改写时，
-三件事要一起改：`is_outbound_send_action`、`rewrite_outbound` 的调用点、回包抹除的匹配路径。
+三件事要一起改：`is_send_action`、`rewrite_outbound` 的调用点、回包抹除的匹配路径。
 
-### 内置指令
-
-只在**群消息**里生效，且要求 `server.command-prefix` 前缀。权限不足、群未启用、
-指令不存在时**静默返回**，不往群里发任何东西。
-
-| 指令 | 权限 | 说明 |
-| --- | --- | --- |
-| `@bot /enable [群号]` | superuser | 启用某群 BOT 服务，缺省当前群 |
-| `@bot /disable [群号]` | superuser | 禁用某群 BOT 服务 |
-| `/bu add\|del <qq>` | superuser | 全局黑用户增减 |
-| `/bu list` | superuser | 黑用户列表 |
-| `/bot` | 无 | 本群已开/已关的 bot |
-| `/bot status` | 无 | 连接状态、延迟、收发计数 |
-| `/bot <name\|alias>` | 无 | 单个 bot 详情 |
-| `/group status` | superuser | 已启用/已禁用的群 |
-| `/group <name\|alias>` | superuser | 某 bot 在各群的开关明细 |
-| `/<name\|alias> on\|off` | superuser | 当前群开/关某个 bot |
-
-注意三个容易踩的点：
-
-- `/enable`、`/disable` 必须 @bot 才被当作指令，没 @ 会原样放行给 bot；
-- 指令处理可能调用 OneBot API（比如解析群名），所以必须在独立 task 里跑
-  （`dispatch::handle_group_event` 已经是 spawn 出去的）：在读循环里同步等 API 回包会死锁；
-- 文案与格式（`✔◉ / ✔◎ / ✔⊗ / ✘⟳ / ¿⟳`、uptime、延迟、`%Y-%-m-%-d %H:%M:%S`）必须
-  是稳定输出格式，改文案算行为变更。
-
-### 运行时状态（db.json）
+### 运行时状态（db.json）与自动清理
 
 ```json
 {
   "enabled_groups": [],
+  "enabled_private_users": [],
   "black_users": [],
-  "bots": { "<name>": { "ids": [] } },
+  "bots": { "<name>": { "groups": [], "users": [] } },
   "group_names": {},
   "joined_groups": []
 }
@@ -174,36 +189,28 @@ bot → 上游的「发言类」API（`send_msg`、`send_group_msg`、`send_priv
 
 - 全部读写走 `store.rs` 的 `Store` 方法，内部有 `parking_lot::RwLock`；落盘用
   「写临时文件再 rename」，不要自己 `fs::write` 直写 `db.json`。
+- 旧版 `bots[name].ids` 通过 serde alias 读成 `groups`；缺失字段按空值补齐。
+- 清理（`server.prune-runtime-state`，默认 true）：
+  - 启动/热更：`prune_config_bots` 删除配置里不存在的 bot 条目；
+  - `get_group_list` 成功且列表非空：`prune_groups` 删除不在列表里的 `enabled_groups`、
+    `bots[*].groups`、`group_names`；列表为空只 warn 不清理；
+  - 私聊用户名单不自动清理（无法可靠判断）。
 - `group_names` / `joined_groups` 是缓存，靠 `get_group_list` 刷新；`resolve_group_name`
-  先查 API（`get_group_info`），失败或超时才退回缓存。
-- 配置热更后会 `sync_bots_from_config`，只补新增的 bot，不删除已有条目。
+  先查 API，失败或超时才退回缓存。
 
 ### 配置与热更新
 
 - `serde_yaml_ng` 解析；`notify` 监听 `config.yaml`（200ms 去抖）；校验失败保留旧配置、
-  只打日志；校验通过后依次：同步 bot 名单 → 替换 `App.config` → 重编译已存在的过滤器。
-- `Config::check` 的约束：`server.host/port/bot-id/user-agent` 必填；`bot-apps[].name`
-  不能带空格、不能占用内置词（`status/enable/disable/bu/bot/group/on/off`）；
-  `name` 与所有 `alias` 在整个配置内大小写不敏感互斥；`group-id.mode` 只能是
-  `whitelist` / `blacklist`；`message.mode` 只能是 `on/off/whitelist/blacklist`；
+  只打日志。
+- 检测到旧字段（`group-id` / `private-message` / `group-message` / 扁平 `message`）时
+  启动报明确迁移错误，不静默忽略。
+- `Config::check` 的约束：`server.host/port/bot-id/user-agent` 必填；
+  `bot-apps[].name` 不能带空格、不能占用内置词；`name` 与所有 `alias` 全局大小写不敏感互斥；
+  `mode.group` / `mode.private` 必须是 `whitelist` / `blacklist`；
+  `message.group/private.mode` 只能是 `on/off/whitelist/blacklist`；
   `rewrite-text.original` 必须能编译。
-- 热更只重新 `compile` **已存在**的过滤器（按名字匹配），新增或删除 bot 应用需要重启进程。
-
-### OneBot API 调用
-
-`api.rs` 的 `call_onebot_api` 用 `echo` 关联请求与回包，默认超时 3 秒，回包经 oneshot
-投递。目前用到的 action：
-
-| action | 用途 | 调用点 |
-| --- | --- | --- |
-| `get_login_info` | 测上游 RTT | `measure_onebot_latency` |
-| `get_group_info` | 解析群名 | `resolve_group_name` |
-| `get_group_list` | 刷新已加入群与群名缓存 | `refresh_joined_groups` |
-| `send_group_msg` | 回复内置指令 | `command::reply_group_text` |
-
-回包统一结构 `{status, retcode, data, message, wording}`；`retcode != 0 && status != "ok"`
-视为失败。本程序发起的回包带 `obf_` 前缀，只由 `try_deliver_api_response` 消费，
-不会被广播给 bot。
+- 热更顺序：`prune_config_bots` → `sync_bots_from_config` → 替换 `App.config` →
+  重编译已存在的过滤器。热更只更新**已存在**的过滤器，新增/删除 bot 需要重启进程。
 
 ### 并发模型
 
@@ -211,10 +218,11 @@ bot → 上游的「发言类」API（`send_msg`、`send_group_msg`、`send_priv
   bot 的读/写/ping 各一条子 task，断开时 abort 并清理。
 - 共享状态都收在 `App`（`global.rs`）：`config: ArcSwap<Config>`、`store: Arc<Store>`、
   `filters: RwLock<Vec<Arc<RwLock<Filter>>>>`、`clients: RwLock<Vec<Arc<Client>>>`、
-  `upstream: RwLock<UpstreamConn>`、统计计数用 `AtomicU64`、改写记录用 `Mutex<RewriteTracker>`。
+  `upstream: RwLock<UpstreamConn>`、统计计数用 `AtomicU64`、改写记录用
+  `Mutex<RewriteTracker>`、上游唯一连接位用 `AtomicBool` CAS。
 - 写 WebSocket 一律经 channel 串行：上游 `mpsc::UnboundedSender<UpstreamWrite>`，
   下游 `mpsc::UnboundedSender<ClientWrite>`；写成功后再按标记计数。
-- 持锁时不要做网络 IO，也不要在 `parking_lot` guard 生命周期内 `.await`（会阻塞 runtime）；
+- 持锁时不要做网络 IO，也不要在 `parking_lot` guard 生命周期内 `.await`；
   需要 await 的逻辑先取快照再放锁。
 - 指令处理可能调 API，必须在独立 task 里跑，不能在读循环里同步等回包。
 
@@ -227,6 +235,7 @@ bot → 上游的「发言类」API（`send_msg`、`send_group_msg`、`send_priv
   `arc-swap`、`chrono`、`log`、`anyhow` 这些依赖，不要引入需要 C 工具链的 TLS/加密库，
   保证三个平台都能原生构建。
 - 源码按职责拆分模块，改逻辑时先看对应模块，不要跨模块复制实现。
+- 消息段 / OneBot action 只能走 `message.rs` 与 `onebot_api.rs`。
 
 ### 错误处理
 
@@ -242,20 +251,20 @@ bot → 上游的「发言类」API（`send_msg`、`send_group_msg`、`send_priv
 
 ### 日志
 
-- 用 `log` 宏；`logging.rs` 把格式固定成 `YYYY/MM/DD HH:MM:SS message`（写 stderr），
-  便于与线上日志对照。
+- 用 `log` 宏；`logging.rs` 把格式固定成 `YYYY/MM/DD HH:MM:SS message`（写 stderr）。
 - `server.debug` 只控制「每条消息的判定结果」这类高频日志，连接建立/断开、错误无条件打。
 - 日志里可以出现群号/账号用于排查，但**不要**打 access-token、完整消息正文。
 
 ## 测试
 
 - `cargo test`：单测在各模块 `#[cfg(test)] mod tests`；集成测试在 `tests/gateway.rs`
-  （进程内起 mock OneBot 上游 + mock bot 下游），覆盖唯一上游限制、群开关、`/enable`、
-  内容过滤、黑用户、出站改写与回包抹除。
+  （进程内起 mock OneBot 上游 + mock bot 下游），覆盖：
+  唯一上游限制（含并发）、群开关与指令、群内容过滤/黑用户、私聊全局白名单 +
+  per-bot 名单 + 私聊内容过滤、`private` 参数指令与查询、出站改写与回包抹除、db 清理。
 - 需要真实 OneBot 实现与 bot 应用的联调不在 CI 里做：本地起一个空 `bot-apps`
   的配置确认能监听，再接入真实环境看日志。
 - CI（`.github/workflows/build.yml`）在 push / PR 上跑 `cargo fmt --check`、
-  `cargo clippy --all-targets -- -D warnings`、`cargo test`，并交叉检查三个平台构建。
+  `cargo clippy --all-targets -- -D warnings`、`cargo test`，并构建三个平台。
 
 ## 构建
 
@@ -281,23 +290,30 @@ release profile 开了 `lto = "thin"`、`codegen-units = 1`、`strip = true`、`
 1. 在 `src/config.rs` 对应结构体里加字段（`serde(rename_all = "kebab-case")` + `default`）；
 2. 需要校验就在 `Check` 里补一条，error 文案要能看出是哪个 bot 的哪一项；
 3. 更新 `config-example.yaml`，只写占位值；
-4. 同步更新 `docs/README_zh.md` 的配置表；
-5. 如果新字段影响热更，确认 `config::reload` 路径能正确处理。
+4. 同步更新 `docs/README_zh.md` / `docs/API.md` 的配置表；
+5. 如果影响热更，确认 `config::reload` 路径能正确处理。
 
-### 新增一个内置指令
+### 新增/修改指令
 
-1. 在 `src/command.rs` 的 `try_handle_command` 里识别指令形态（注意大小写、别名、
-   是否要求 @bot）；
-2. 在 `needs_super` 里决定是否需要 superuser；
+1. 在 `src/command.rs` 的 `try_handle_command` 里识别指令形态（大小写、别名、是否要 @bot、
+   末位 `private` 参数的含义）；
+2. 在 `needs_super` / `private_related` 里决定权限和是否受群开关限制；
 3. 写处理函数，通过 `reply_group_text` 回复，不要自己拼 WebSocket 帧；
-4. 更新 `docs/README_zh.md` 与 `AGENTS.md` 的指令表。
+4. 更新 `docs/README_zh.md` 与 `docs/API.md` 的指令表。
 
-### 修改过滤逻辑
+### 修改群/私聊闸门
 
-- 入口是 `src/dispatch.rs` 的 `handle_group_event`；先想清楚改的是「群级闸门」还是
-  「bot 级闸门」，不要破坏现有顺序（指令永远最先、黑用户其次）。
-- 只影响消息内容的判定放 `filters.rs`，不要写进 `dispatch.rs`。
-- 改完确认：未启用的群仍然不转发；黑用户仍然优先于一切 bot 分发。
+- 入口是 `src/gate.rs`；先想清楚改的是全局开关、黑用户，还是 per-bot 名单；
+- 顺序是稳定行为：群聊「命令 → 群启用 → 黑用户 → 群名单」；
+  私聊「私聊白名单 → 黑用户 → 私聊名单」；
+- 内容过滤放 `filters.rs`，投递循环只有 `dispatch::deliver_to_bots` 一处。
+
+### 新增 OneBot API
+
+1. 在 `src/onebot_api.rs` 加 typed `Action` / `SendAction`；
+2. 需要改写判定就同步 `is_send_action` 列表；
+3. 在 `api.rs` / `command.rs` 等调用方使用 typed 接口；
+4. 更新 `docs/API.md` 的 API 清单。
 
 ### 修改出站改写
 
@@ -330,9 +346,9 @@ release profile 开了 `lto = "thin"`、`codegen-units = 1`、`strip = true`、`
 示例：
 
 ```text
-[Feat] Add per-group bot toggles
+[Feat] Add private message routing and state pruning
 [Fix] Drop rewritten self reports
-[Chore] Bump websocket dependency
+[Chore] Unify OneBot API layer
 ```
 
 ## GitHub Actions
@@ -355,5 +371,6 @@ release profile 开了 `lto = "thin"`、`codegen-units = 1`、`strip = true`、`
 
 - 版本号用 `vX.Y.Z` 的 tag；
 - release notes 只写用户关心的事：新增功能、行为变化、修复；
+- 配置破坏性变更（第二代 schema）与 db 自动清理必须在 release notes 里写清楚；
 - 不要提内部基础设施（内网地址、服务器名、私有部署细节），也不要带真实账号信息；
 - 预发布（`-alpha` / `-beta` / `-rc`）勾选 pre-release，正式版不勾。

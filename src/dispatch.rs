@@ -1,4 +1,9 @@
-//! 入站分发与闸门（对应 Go 版 `dispatch.go`）。
+//! 入站分发与闸门。
+//!
+//! 群聊：指令 → 群启用 → 黑用户 → per-bot 群名单 → message.group → 转发
+//! 私聊：全局私聊白名单 → 黑用户 → per-bot 私聊名单 → message.private → 转发
+//!
+//! 群聊/私聊共用 `gate` 与 `deliver_to_bots`，只有“全局开关”和“名单”不同。
 
 use std::sync::Arc;
 
@@ -6,6 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::api;
 use crate::command;
+use crate::gate::{self, ChatKind};
 use crate::global::{App, ClientWrite, GROUP, PRIVATE};
 use crate::onebot_message::{parse, OneBotMessage};
 use crate::rewrite::{
@@ -63,16 +69,24 @@ pub fn dispatch_incoming(app: &Arc<App>, is_text: bool, raw: &[u8]) {
             .update_group_name_if_changed(msg.partial.group_id, &msg.partial.group_name);
     }
 
-    // 带 group_id 的事件一律过闸；指令可能调 API，必须放独立任务
-    if msg.partial.group_id != 0 {
-        let app = app.clone();
-        tokio::spawn(async move {
-            handle_group_event(app, msg).await;
-        });
+    // 群 / 私聊 message 统一走闸门
+    if let Some(kind) = gate::classify(&msg) {
+        match kind {
+            ChatKind::Group { .. } => {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    handle_group_event(app, msg).await;
+                });
+            }
+            ChatKind::Private { .. } => {
+                // 私聊流程不会调用 API，直接在当前任务处理，避免无意义的 spawn。
+                handle_private_event(app, &msg);
+            }
+        }
         return;
     }
 
-    // 无群号的 message / notice / request（私聊、好友戳一戳等）一律不转
+    // 无群号的 message / notice / request（好友戳一戳、私聊回执等）一律不转
     let pt = msg.partial.post_type.as_str();
     if pt == "message"
         || pt == "message_sent"
@@ -82,7 +96,7 @@ pub fn dispatch_incoming(app: &Arc<App>, is_text: bool, raw: &[u8]) {
     {
         if app.config().server.debug {
             log::info!(
-                "dispatch: 非群事件丢弃 post_type={} message_type={} user={}",
+                "dispatch: 非群/非私聊消息事件丢弃 post_type={} message_type={} user={}",
                 pt,
                 msg.partial.message_type,
                 msg.partial.user_id
@@ -105,94 +119,101 @@ async fn handle_group_event(app: Arc<App>, msg: OneBotMessage) {
                 msg.partial.group_id,
                 msg.partial.message_id,
                 &reply,
-            )
-            .await;
-        }
-        return;
-    }
-
-    if app.store.is_black_user(msg.partial.user_id) {
-        if app.config().server.debug {
-            log::info!("dispatch: 黑用户 {} 丢弃", msg.partial.user_id);
-        }
-        return;
-    }
-
-    if !app.store.is_group_enabled(msg.partial.group_id) {
-        if app.config().server.debug {
-            log::info!(
-                "dispatch: 群 {} 未 enable，丢弃 post_type={}",
-                msg.partial.group_id,
-                msg.partial.post_type
             );
         }
         return;
     }
 
-    let is_chat = msg.partial.message_type == GROUP || msg.partial.message_type == PRIVATE;
-
-    for client in app.snapshot_clients() {
-        let cfg = match app.find_bot_app(&client.name) {
-            Some(c) => c,
-            None => continue,
-        };
-        if !app
-            .store
-            .is_bot_allowed(&cfg.name, &cfg.group_id.mode, msg.partial.group_id)
-        {
+    let kind = ChatKind::Group {
+        group_id: msg.partial.group_id,
+    };
+    match gate::global_gate(&app, kind, msg.partial.user_id) {
+        Ok(()) => {}
+        Err(reason) => {
             if app.config().server.debug {
                 log::info!(
-                    "dispatch: bot {} 名单未通过 group={} post_type={}",
-                    cfg.name,
-                    msg.partial.group_id,
-                    msg.partial.post_type
+                    "dispatch: 丢弃（{}）group={}",
+                    reason.as_str(),
+                    msg.partial.group_id
+                );
+            }
+            return;
+        }
+    }
+    deliver_to_bots(&app, &msg, kind);
+}
+
+fn handle_private_event(app: &Arc<App>, msg: &OneBotMessage) {
+    let kind = ChatKind::Private {
+        user_id: msg.partial.user_id,
+    };
+    match gate::global_gate(app, kind, msg.partial.user_id) {
+        Ok(()) => {}
+        Err(reason) => {
+            if app.config().server.debug {
+                log::info!(
+                    "dispatch: 丢弃（{}）private user={}",
+                    reason.as_str(),
+                    msg.partial.user_id
+                );
+            }
+            return;
+        }
+    }
+    deliver_to_bots(app, msg, kind);
+}
+
+/// 把一条已通过全局闸门的消息，按每个 bot 的名单与内容过滤投递出去。
+///
+/// 优化点：消息只 clone（不再每 bot 重新 parse）；内容过滤没有改写时直接透传
+/// 原始字节，避免每 bot 重新序列化。
+fn deliver_to_bots(app: &Arc<App>, msg: &OneBotMessage, kind: ChatKind) {
+    let cfg = app.config();
+    let debug = cfg.server.debug;
+
+    for client in app.snapshot_clients() {
+        let Some(bot) = cfg.bot_apps.iter().find(|b| b.name == client.name) else {
+            continue;
+        };
+        if !gate::bot_list_gate(app, bot, kind) {
+            if debug {
+                log::info!(
+                    "dispatch: bot {} 名单未通过（{}）",
+                    bot.name,
+                    kind.describe()
                 );
             }
             continue;
         }
-        if is_chat {
-            let mut cloned = match parse(&msg.raw) {
-                Some(c) => c,
-                None => continue,
-            };
-            {
-                let filter = client.filter.read();
-                if !filter.filter_content(&mut cloned) {
-                    if app.config().server.debug {
-                        log::info!("dispatch: bot {} 内容过滤未通过", cfg.name);
-                    }
+
+        let mut cloned = msg.clone();
+        let decision = client.filter.read().filter_content(&mut cloned, debug);
+        if !decision.allowed {
+            continue;
+        }
+
+        let data: Vec<u8> = if decision.modified {
+            match serde_json::to_vec(&cloned.intact) {
+                Ok(d) => d,
+                Err(e) => {
+                    log::error!("dispatch: 序列化失败 {}: {}", bot.name, e);
                     continue;
                 }
             }
-            let data = match serde_json::to_vec(&cloned.intact) {
-                Ok(d) => d,
-                Err(e) => {
-                    log::error!("dispatch: 序列化失败 {}: {}", cfg.name, e);
-                    continue;
-                }
-            };
-            let _ = client.tx.send(ClientWrite {
-                msg: Message::Text(String::from_utf8_lossy(&data).into_owned().into()),
-                inc_bot_recv: true,
-            });
         } else {
-            // notice / request 等：过闸后原样转发，不计 bot 收
-            let _ = client.tx.send(ClientWrite {
-                msg: text_message(&msg.raw),
-                inc_bot_recv: false,
-            });
-        }
+            cloned.raw
+        };
+        let _ = client.tx.send(ClientWrite {
+            msg: Message::Text(String::from_utf8_lossy(&data).into_owned().into()),
+            inc_bot_recv: true,
+        });
     }
-}
-
-fn text_message(raw: &[u8]) -> Message {
-    Message::Text(String::from_utf8_lossy(raw).into_owned().into())
 }
 
 fn broadcast_raw(app: &Arc<App>, is_text: bool, raw: &[u8]) {
     for client in app.snapshot_clients() {
         let msg = if is_text {
-            text_message(raw)
+            Message::Text(String::from_utf8_lossy(raw).into_owned().into())
         } else {
             Message::Binary(raw.to_vec().into())
         };

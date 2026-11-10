@@ -1,34 +1,11 @@
 //! OneBot v11 消息事件的宽松解析与辅助判断（对应 Go 版 `onebotMessage.go`）。
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::global::{MESSAGE_FORMAT_ARRAY, MESSAGE_FORMAT_STRING, MESSAGE_TYPE_TEXT};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MessageContent {
-    #[serde(rename = "type", default)]
-    pub r#type: String,
-    #[serde(default)]
-    pub data: Map<String, Value>,
-}
-
-impl MessageContent {
-    pub fn from_value(v: &Value) -> Option<Self> {
-        let obj = v.as_object()?;
-        let r#type = obj
-            .get("type")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let data = obj
-            .get("data")
-            .and_then(|x| x.as_object())
-            .cloned()
-            .unwrap_or_default();
-        Some(Self { r#type, data })
-    }
-}
+/// 消息段模型与出站共用（见 `message::Segment`）。
+pub use crate::message::Segment as MessageContent;
 
 #[derive(Debug, Clone, Default)]
 pub struct Partial {
@@ -75,7 +52,7 @@ fn parse_array(v: &Value) -> Option<Vec<MessageContent>> {
     let arr = v.as_array()?;
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
-        out.push(MessageContent::from_value(item)?);
+        out.push(crate::message::Segment::from_value(item)?);
     }
     Some(out)
 }
@@ -139,7 +116,7 @@ impl OneBotMessage {
             return false;
         }
         for seg in &self.partial.message_array {
-            if seg.r#type != "at" {
+            if seg.ty != "at" {
                 continue;
             }
             if qq_from_data(&seg.data) == self_id {
@@ -160,7 +137,7 @@ impl OneBotMessage {
                 return true;
             }
             for seg in &self.partial.message_array {
-                if seg.r#type == "at" && qq_from_data(&seg.data) == sid {
+                if seg.ty == "at" && qq_from_data(&seg.data) == sid {
                     return true;
                 }
             }
@@ -176,7 +153,7 @@ impl OneBotMessage {
                     .partial
                     .message_array
                     .iter()
-                    .filter(|seg| seg.r#type == MESSAGE_TYPE_TEXT)
+                    .filter(|seg| seg.ty == MESSAGE_TYPE_TEXT)
                     .filter_map(|seg| {
                         let t = seg
                             .data
