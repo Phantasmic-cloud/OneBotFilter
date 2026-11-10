@@ -50,7 +50,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             binary: onebotfilter.exe
             artifact: onebotfilter-windows-amd64.exe
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             binary: onebotfilter
             artifact: onebotfilter-macos-arm64
