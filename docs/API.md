@@ -104,14 +104,30 @@ x-client-role: Universal
 | `alias` | string[] | 别名，全局大小写不敏感互斥 |
 | `uri` | string | 反向 WS 地址 |
 | `access-token` | string | Bearer token，可空 |
-| `mode.group` | `whitelist`/`blacklist` | 群名单模式（必填） |
-| `mode.private` | `whitelist`/`blacklist` | 私聊用户名单模式（必填） |
-| `message.group` | object | 群消息过滤（`mode`/`filters`/`prefix`/`prefix-replace`） |
-| `message.private` | object | 私聊消息过滤，字段同上 |
+| `mode` | `whitelist`/`blacklist` | 群聊与私聊共用的名单模式 |
+| `message` | object | 群聊与私聊共用的消息过滤（`mode`/`filters`/`prefix`/`prefix-replace`） |
+| `group` | object | 群聊覆盖：`mode` 与/或 `message`，可选 |
+| `private` | object | 私聊覆盖：`mode` 与/或 `message`，可选 |
 | `rewrite-text` | object[] | 出站改写：`{ original, replace }`（正则） |
 
-旧字段（`group-id`、`group-message`、`private-message`、扁平 `message`）不再兼容，
-启动时返回迁移错误。映射见 `docs/README_zh.md` 的“从旧配置迁移”。
+生效规则：
+
+- 群聊 / 私聊先继承 bot 级 `mode` 与 `message`，再被同名侧块覆盖：`group.mode` /
+  `private.mode` 整体替换沿用值，`group.message` / `private.message` 按字段合并
+  （只写 `filters` 就只改 filters，其余沿用共用配置）；
+- 群聊 / 私聊最终都必须拿到 `mode`（`whitelist` / `blacklist`）：写 bot 级 `mode`，
+  或两侧各写 `group.mode` / `private.mode`；
+- 群聊和私聊配置完全一样时只写 bot 级一份；完全不同时只写 `group` / `private` 两块。
+
+旧配置迁移（启动时报错并提示）：
+
+| 旧写法 | 新写法 |
+| --- | --- |
+| v1 `group-id.mode` | bot 级 `mode` |
+| v1 `group-message` / `private-message` | `group.message` / `private.message` |
+| v1 扁平 `message`（默认过滤） | bot 级 `message` |
+| v2 `mode.group` / `mode.private` | `group.mode` / `private.mode` |
+| v2 `message.group` / `message.private` | `group.message` / `private.message` |
 
 ## 6. db.json 状态
 

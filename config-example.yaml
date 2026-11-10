@@ -18,46 +18,54 @@ server:
   prune-runtime-state: true # 自动清理 db.json 里已不存在的 bot / 群相关状态
 
 # bot-apps：要接入的下游 bot 应用，可配多个
+#
+# bot 级的 mode / message 是群聊和私聊共用的默认配置；
+# 某一侧不同时，在 group / private 块里只写要改的字段（message 按字段合并）。
 bot-apps:
+  # 1) 群聊和私聊配置完全一样：写一遍就够
   - name: "alpha"                # 指令里用的名字，不能带空格，也不能叫 status/enable/disable/bu/bot/group/on/off
     alias: [ "a", "甲" ]          # 别名，同样不能与其它 name/alias 重复
     uri: "ws://127.0.0.1:8080/onebot/v11/ws"  # 该 bot 应用的反向 WS 地址
     access-token: ""             # 需要鉴权时填，连接时以 Bearer 头带上
 
-    # 名单模式：
-    # - group 决定「该 bot 的群名单」是白名单还是黑名单（存 db.json bots[name].groups）
-    # - private 决定「该 bot 的私聊用户名单」是白名单还是黑名单（存 db.json bots[name].users）
-    # 私聊还需要全局私聊白名单（@bot /enable <qq> private）先放行该用户。
-    mode:
-      group: "blacklist"
-      private: "whitelist"
+    # 名单模式：群名单（db.json 的 bots[name].groups）和私聊用户名单（bots[name].users）
+    # 都用 blacklist；私聊还需要全局私聊白名单（@bot /enable <qq> private）先放行该用户。
+    mode: "blacklist"
 
-    # 消息过滤：群聊 / 私聊分别配置，缺省 mode 视为 on
+    # 消息过滤：群聊与私聊共用
     message:
-      group:
-        mode: "blacklist"          # on 全放行 | off 全拦截 | whitelist 命中才放行 | blacklist 命中才拦截
-        filters: [ "^(help|帮助)", "^/status" ]  # 正则列表（fancy-regex 语法）
-        prefix: [ "#" ]            # 以此前缀开头的消息直接放行
-        prefix-replace: ""         # 放行时把前缀替换成这个（如 "" 直接吃掉前缀）
-      private:
-        mode: "on"
-        filters: []
+      mode: "blacklist"          # on 全放行 | off 全拦截 | whitelist 命中才放行 | blacklist 命中才拦截
+      filters: [ "^(help|帮助)", "^/status" ]  # 正则列表（fancy-regex 语法）
+      prefix: [ "#" ]            # 以此前缀开头的消息直接放行
+      prefix-replace: ""         # 放行时把前缀替换成这个（如 "" 直接吃掉前缀）
 
     # 出站文本改写：bot 通过 OneBotFilter 发言时，按正则替换后再送出
     rewrite-text:
       - original: "v[0-9]+\\.[0-9]+\\.[0-9]+"
         replace: "v1.0.0"
-      - original: "牛牛"
-        replace: "哞哞"
 
+  # 2) 只差一点：写共用配置，再在某一侧只覆盖要改的字段
   - name: "beta"
     alias: [ "b" ]
     uri: "ws://127.0.0.1:8081/onebot/v11/ws"
-    mode:
-      group: "blacklist"
-      private: "whitelist"
+    mode: "blacklist"
     message:
-      group:
+      mode: "on"
+      filters: [ "^secret" ]
+    private:
+      mode: "whitelist"          # 私聊名单改用白名单
+      message:
+        mode: "off"              # 该 bot 不接收私聊
+
+  # 3) 群聊私聊完全不同：不写共用配置，两侧各写各的
+  - name: "gamma"
+    alias: [ "g" ]
+    uri: "ws://127.0.0.1:8082/onebot/v11/ws"
+    group:
+      mode: "whitelist"
+      message:
         mode: "on"
-      private:
-        mode: "off"               # 该 bot 不接收私聊
+    private:
+      mode: "blacklist"
+      message:
+        mode: "off"

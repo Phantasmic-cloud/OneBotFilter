@@ -1,10 +1,10 @@
 //! 配置结构、校验与热更新。
 //!
-//! 第二代 schema：
-//! - `mode.group` / `mode.private`：per-bot 群名单 / 私聊用户名单的白黑模式；
-//! - `message.group` / `message.private`：两种会话各自的消息过滤配置；
-//! - 旧的 `group-id` / `group-message` / `private-message` / 扁平 `message` 不再兼容，
-//!   加载时会给出明确的迁移错误。
+//! 第三代 schema：
+//! - bot 级 `mode` / `message` 是群聊和私聊共用的默认值；
+//! - `group` / `private` 块是单侧覆盖，`message` 按字段深合并（只写要改的字段）；
+//! - 旧字段（v1 的 `group-id` / `group-message` / `private-message`、v2 的
+//!   `mode.group` / `message.group`）不兼容，加载时给出明确的迁移提示。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate::global::App;
 use crate::global::{BLACKLIST, OFF, ON, WHITELIST};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", default)]
+// ---- 运行时结构（解析后已把共用配置与单侧覆盖合并成两侧各一份）----
+
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     pub server: ServerConfig,
     pub bot_apps: Vec<BotAppsConfig>,
@@ -59,29 +60,26 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", default)]
+#[derive(Debug, Clone, Default)]
 pub struct BotAppsConfig {
     pub name: String,
     pub alias: Vec<String>,
     pub uri: String,
     pub access_token: String,
-    /// 群名单 / 私聊用户名单的白黑模式。
+    /// 群名单 / 私聊用户名单的白黑模式（已合并共用模式与单侧覆盖）。
     pub mode: ModeConfig,
-    /// 群消息 / 私聊消息的过滤配置。
+    /// 群消息 / 私聊消息的过滤配置（已合并共用配置与单侧覆盖）。
     pub message: BotMessageConfig,
     pub rewrite_text: Vec<RewriteTextRule>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", default)]
+#[derive(Debug, Clone, Default)]
 pub struct ModeConfig {
     pub group: String,
     pub private: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", default)]
+#[derive(Debug, Clone, Default)]
 pub struct BotMessageConfig {
     pub group: MessageConfig,
     pub private: MessageConfig,
@@ -101,6 +99,114 @@ pub struct MessageConfig {
 pub struct RewriteTextRule {
     pub original: String,
     pub replace: String,
+}
+
+// ---- 原始配置：bot 级共用 + group/private 单侧覆盖 ----
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+struct RawConfig {
+    server: ServerConfig,
+    bot_apps: Vec<RawBotAppsConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+struct RawBotAppsConfig {
+    name: String,
+    alias: Vec<String>,
+    uri: String,
+    access_token: String,
+    /// 群聊与私聊共用的名单模式，可被 group.mode / private.mode 覆盖。
+    mode: Option<String>,
+    /// 群聊与私聊共用的消息过滤，可被 group.message / private.message 按字段覆盖。
+    message: Option<MessageConfig>,
+    group: Option<RawSide>,
+    private: Option<RawSide>,
+    rewrite_text: Vec<RewriteTextRule>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+struct RawSide {
+    mode: Option<String>,
+    message: Option<MessageOverride>,
+}
+
+/// 单侧 message 覆盖：只写要改的字段，其余沿用共用配置。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+struct MessageOverride {
+    mode: Option<String>,
+    filters: Option<Vec<String>>,
+    prefix: Option<Vec<String>>,
+    prefix_replace: Option<String>,
+}
+
+impl RawBotAppsConfig {
+    fn resolve(&self, index: usize) -> Result<BotAppsConfig, String> {
+        let who = if self.name.is_empty() {
+            format!("bot-apps[{index}]")
+        } else {
+            format!("bot-apps[{index}]（{}）", self.name)
+        };
+
+        let shared_mode = self.mode.as_deref();
+        let group_mode = self
+            .group
+            .as_ref()
+            .and_then(|side| side.mode.as_deref())
+            .or(shared_mode)
+            .ok_or_else(|| format!("{who} 缺少群聊名单模式：写 bot 级 mode 或 group.mode"))?;
+        let private_mode = self
+            .private
+            .as_ref()
+            .and_then(|side| side.mode.as_deref())
+            .or(shared_mode)
+            .ok_or_else(|| format!("{who} 缺少私聊名单模式：写 bot 级 mode 或 private.mode"))?;
+
+        let shared_message = self.message.clone().unwrap_or_default();
+        let group_message = merge_message(
+            &shared_message,
+            self.group.as_ref().and_then(|side| side.message.as_ref()),
+        );
+        let private_message = merge_message(
+            &shared_message,
+            self.private.as_ref().and_then(|side| side.message.as_ref()),
+        );
+
+        Ok(BotAppsConfig {
+            name: self.name.clone(),
+            alias: self.alias.clone(),
+            uri: self.uri.clone(),
+            access_token: self.access_token.clone(),
+            mode: ModeConfig {
+                group: group_mode.to_string(),
+                private: private_mode.to_string(),
+            },
+            message: BotMessageConfig {
+                group: group_message,
+                private: private_message,
+            },
+            rewrite_text: self.rewrite_text.clone(),
+        })
+    }
+}
+
+/// 单侧 message 覆盖：逐字段取覆盖值，没写的字段沿用共用配置。
+fn merge_message(base: &MessageConfig, over: Option<&MessageOverride>) -> MessageConfig {
+    let Some(over) = over else {
+        return base.clone();
+    };
+    MessageConfig {
+        mode: over.mode.clone().unwrap_or_else(|| base.mode.clone()),
+        filters: over.filters.clone().unwrap_or_else(|| base.filters.clone()),
+        prefix: over.prefix.clone().unwrap_or_else(|| base.prefix.clone()),
+        prefix_replace: over
+            .prefix_replace
+            .clone()
+            .unwrap_or_else(|| base.prefix_replace.clone()),
+    }
 }
 
 impl ServerConfig {
@@ -296,22 +402,30 @@ fn detect_legacy_fields(raw: &serde_json::Value) -> Result<(), String> {
     };
     for (i, bot) in bots.iter().enumerate() {
         let Some(map) = bot.as_object() else { continue };
+        // 第一代（Go 原版）
         for old in ["group-id", "group-message", "private-message"] {
             if map.contains_key(old) {
                 return Err(format!(
-                    "bot-apps[{i}] 使用了旧字段 {old:?}；新版改为 mode.group/mode.private 与 \
-                     message.group/message.private，请参考 config-example.yaml 迁移"
+                    "bot-apps[{i}] 使用了第一代字段 {old:?}；迁移：group-id.mode → bot 级 mode，\
+                     group-message → group.message，private-message → private.message；\
+                     群聊私聊配置一样时只写 bot 级 message"
                 ));
             }
         }
-        if let Some(message) = map.get("message").and_then(|m| m.as_object()) {
-            let is_old_flat = ["mode", "filters", "prefix", "prefix-replace"]
-                .iter()
-                .any(|k| message.contains_key(*k));
-            if is_old_flat {
+        // 第二代（两侧各写一份）
+        if let Some(serde_json::Value::Object(mode)) = map.get("mode") {
+            if mode.contains_key("group") || mode.contains_key("private") {
                 return Err(format!(
-                    "bot-apps[{i}].message 使用了旧扁平结构；新版拆成 \
-                     message.group / message.private，请参考 config-example.yaml 迁移"
+                    "bot-apps[{i}].mode 是第二代写法；现在 bot 级 mode 是群聊/私聊共用的默认值，\
+                     两侧不同时写 group.mode / private.mode"
+                ));
+            }
+        }
+        if let Some(serde_json::Value::Object(message)) = map.get("message") {
+            if message.contains_key("group") || message.contains_key("private") {
+                return Err(format!(
+                    "bot-apps[{i}].message 是第二代写法；现在 bot 级 message 是共用的默认值，\
+                     两侧不同时写 group.message / private.message"
                 ));
             }
         }
@@ -322,10 +436,25 @@ fn detect_legacy_fields(raw: &serde_json::Value) -> Result<(), String> {
 /// 读取并校验配置文件。
 pub fn load_config(path: &str) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let probe: serde_json::Value = serde_yaml_ng::from_str(&text).map_err(|e| e.to_string())?;
+    parse_config_text(&text)
+}
+
+/// 解析配置文本：先把 bot 级共用配置与 group/private 覆盖合并成两侧各一份。
+fn parse_config_text(text: &str) -> Result<Config, String> {
+    let probe: serde_json::Value = serde_yaml_ng::from_str(text).map_err(|e| e.to_string())?;
     detect_legacy_fields(&probe)?;
 
-    let mut cfg: Config = serde_yaml_ng::from_str(&text).map_err(|e| e.to_string())?;
+    let raw: RawConfig = serde_yaml_ng::from_str(text).map_err(|e| e.to_string())?;
+    let bot_apps = raw
+        .bot_apps
+        .iter()
+        .enumerate()
+        .map(|(i, bot)| bot.resolve(i))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut cfg = Config {
+        server: raw.server,
+        bot_apps,
+    };
     cfg.check()?;
     Ok(cfg)
 }
@@ -584,36 +713,127 @@ mod tests {
         assert!(cfg.check().is_err());
     }
 
+    fn parse_bot_yaml(bots: &str) -> Result<Config, String> {
+        let text = format!(
+            "server:\n  host: \"127.0.0.1\"\n  port: 3939\n  suffix: \"/ws\"\n  \
+             bot-id: \"123456789\"\n  user-agent: \"OneBotFilter\"\n  superusers: [ 123456789 ]\n\
+             bot-apps:\n{bots}"
+        );
+        parse_config_text(&text)
+    }
+
+    #[test]
+    fn parses_shared_config() {
+        let cfg = parse_bot_yaml(
+            "  - name: \"alpha\"\n    uri: \"ws://127.0.0.1:8080/onebot\"\n    \
+             mode: \"blacklist\"\n    message:\n      mode: \"on\"\n      filters: [\"^hi\"]\n",
+        )
+        .unwrap();
+        let bot = &cfg.bot_apps[0];
+        assert_eq!(bot.mode.group, BLACKLIST);
+        assert_eq!(bot.mode.private, BLACKLIST);
+        assert_eq!(bot.message.group.mode, ON);
+        assert_eq!(bot.message.private.mode, ON);
+        assert_eq!(bot.message.group.filters, vec!["^hi"]);
+        assert_eq!(bot.message.private.filters, vec!["^hi"]);
+    }
+
+    #[test]
+    fn parses_side_overrides() {
+        let cfg = parse_bot_yaml(
+            "  - name: \"alpha\"\n    uri: \"ws://127.0.0.1:8080/onebot\"\n    \
+             mode: \"blacklist\"\n    message:\n      mode: \"on\"\n      filters: [\"^hi\"]\n      \
+             prefix: [\"#\"]\n    private:\n      mode: \"whitelist\"\n      message:\n        \
+             mode: \"off\"\n        prefix: [\"!\"]\n",
+        )
+        .unwrap();
+        let bot = &cfg.bot_apps[0];
+        assert_eq!(bot.mode.group, BLACKLIST);
+        assert_eq!(bot.mode.private, WHITELIST);
+        assert_eq!(bot.message.group.mode, ON);
+        assert_eq!(bot.message.private.mode, OFF);
+        // 没写的字段沿用共用配置
+        assert_eq!(bot.message.private.filters, vec!["^hi"]);
+        // 写了的字段覆盖
+        assert_eq!(bot.message.group.prefix, vec!["#"]);
+        assert_eq!(bot.message.private.prefix, vec!["!"]);
+    }
+
+    #[test]
+    fn parses_split_only() {
+        let cfg = parse_bot_yaml(
+            "  - name: \"alpha\"\n    uri: \"ws://127.0.0.1:8080/onebot\"\n    group:\n      \
+             mode: \"whitelist\"\n      message:\n        mode: \"on\"\n    private:\n      \
+             mode: \"blacklist\"\n      message:\n        mode: \"off\"\n",
+        )
+        .unwrap();
+        let bot = &cfg.bot_apps[0];
+        assert_eq!(bot.mode.group, WHITELIST);
+        assert_eq!(bot.mode.private, BLACKLIST);
+        assert_eq!(bot.message.group.mode, ON);
+        assert_eq!(bot.message.private.mode, OFF);
+        assert!(bot.message.group.filters.is_empty());
+    }
+
+    #[test]
+    fn missing_mode_errors() {
+        let err = parse_bot_yaml(
+            "  - name: \"alpha\"\n    uri: \"ws://127.0.0.1:8080/onebot\"\n    group:\n      \
+             mode: \"blacklist\"\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("缺少私聊名单模式"), "{err}");
+
+        let err = parse_bot_yaml(
+            "  - name: \"alpha\"\n    uri: \"ws://127.0.0.1:8080/onebot\"\n    message:\n      \
+             mode: \"on\"\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("缺少群聊名单模式"), "{err}");
+    }
+
     #[test]
     fn detects_legacy_fields() {
-        let old_group_id = serde_json::json!({
+        // 第一代：Go 原版字段
+        let v1 = serde_json::json!({
             "bot-apps": [{
                 "name": "alpha",
                 "uri": "ws://127.0.0.1:8080/onebot/v11/ws",
                 "group-id": { "mode": "blacklist" },
-                "message": { "mode": "on" }
+                "private-message": { "mode": "on" }
             }]
         });
-        assert!(detect_legacy_fields(&old_group_id).is_err());
+        let err = detect_legacy_fields(&v1).unwrap_err();
+        assert!(err.contains("第一代"), "{err}");
 
-        let old_flat_message = serde_json::json!({
+        // 第二代：mode/message 各写两侧
+        let v2_mode = serde_json::json!({
             "bot-apps": [{
                 "name": "alpha",
                 "uri": "ws://127.0.0.1:8080/onebot/v11/ws",
-                "mode": { "group": "blacklist", "private": "whitelist" },
-                "message": { "mode": "on" }
+                "mode": { "group": "blacklist", "private": "whitelist" }
             }]
         });
-        assert!(detect_legacy_fields(&old_flat_message).is_err());
-
-        let current = serde_json::json!({
+        assert!(detect_legacy_fields(&v2_mode).is_err());
+        let v2_message = serde_json::json!({
             "bot-apps": [{
                 "name": "alpha",
                 "uri": "ws://127.0.0.1:8080/onebot/v11/ws",
-                "mode": { "group": "blacklist", "private": "whitelist" },
                 "message": { "group": { "mode": "on" }, "private": { "mode": "on" } }
             }]
         });
-        assert!(detect_legacy_fields(&current).is_ok());
+        assert!(detect_legacy_fields(&v2_message).is_err());
+
+        // 第三代：共用 + 单侧覆盖
+        let v3 = serde_json::json!({
+            "bot-apps": [{
+                "name": "alpha",
+                "uri": "ws://127.0.0.1:8080/onebot/v11/ws",
+                "mode": "blacklist",
+                "message": { "mode": "on" },
+                "private": { "mode": "whitelist" }
+            }]
+        });
+        assert!(detect_legacy_fields(&v3).is_ok());
     }
 }

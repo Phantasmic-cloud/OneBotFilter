@@ -24,7 +24,7 @@ src/
   main.rs                 入口：建 tokio runtime，调用 lib::run("config.yaml")
   lib.rs                  run()：加载配置/状态、监听上游、起各 bot 客户端、配置热更
   global.rs               常量、App 共享状态、连接/统计/过滤器注册、上游唯一连接位
-  config.rs               配置结构（mode.group/private、message.group/private）、校验、旧字段检测、热更
+  config.rs               配置结构（bot 级共用 mode/message + group/private 覆盖）、解析合并、校验、旧字段检测、热更
   onebot_message.rs       事件宽松解析、@我判断、指令文本提取、CQ at 处理
   message.rs              统一消息段 Segment / 出站 OutboundMessage（字符串或数组）
   onebot_api.rs           统一 OneBot API：typed action、echo 关联、回包解析、发送类判定
@@ -199,14 +199,29 @@ bot → 上游的「发言类」API（`send_msg`、`send_group_msg`、`send_priv
 
 ### 配置与热更新
 
+- **第三代 schema**：bot 级 `mode` / `message` 是群聊和私聊共用的默认值；
+  `group` / `private` 块是单侧覆盖（`mode` 整体替换、`message` 按字段深合并）；
+  解析时先合并成两侧各一份 `ModeConfig` / `BotMessageConfig`，运行时只认合并后的结果：
+
+  ```yaml
+  - name: "alpha"
+    mode: "blacklist"          # 群聊 + 私聊共用
+    message: { mode: "on" }    # 群聊 + 私聊共用
+    private:                   # 可选：只改私聊
+      mode: "whitelist"
+      message: { mode: "off" } # 其余字段沿用共用配置
+  ```
+
+  两侧最终都必须有 `mode`，否则加载报错；群聊私聊完全一样时只写 bot 级一份即可。
 - `serde_yaml_ng` 解析；`notify` 监听 `config.yaml`（200ms 去抖）；校验失败保留旧配置、
   只打日志。
-- 检测到旧字段（`group-id` / `private-message` / `group-message` / 扁平 `message`）时
-  启动报明确迁移错误，不静默忽略。
+- 检测到旧字段时启动报明确迁移提示，不静默忽略：
+  - v1：`group-id` / `group-message` / `private-message`；
+  - v2：`mode` 是含 `group`/`private` 的对象、`message` 是含 `group`/`private` 的对象。
 - `Config::check` 的约束：`server.host/port/bot-id/user-agent` 必填；
   `bot-apps[].name` 不能带空格、不能占用内置词；`name` 与所有 `alias` 全局大小写不敏感互斥；
-  `mode.group` / `mode.private` 必须是 `whitelist` / `blacklist`；
-  `message.group/private.mode` 只能是 `on/off/whitelist/blacklist`；
+  合并后的 `mode.group` / `mode.private` 必须是 `whitelist` / `blacklist`；
+  合并后的 `message.group/private.mode` 只能是 `on/off/whitelist/blacklist`；
   `rewrite-text.original` 必须能编译。
 - 热更顺序：`prune_config_bots` → `sync_bots_from_config` → 替换 `App.config` →
   重编译已存在的过滤器。热更只更新**已存在**的过滤器，新增/删除 bot 需要重启进程。
@@ -372,6 +387,7 @@ release profile 开了 `lto = "thin"`、`codegen-units = 1`、`strip = true`、`
 
 - 版本号用 `vX.Y.Z` 的 tag；
 - release notes 只写用户关心的事：新增功能、行为变化、修复；
-- 配置破坏性变更（第二代 schema）与 db 自动清理必须在 release notes 里写清楚；
+- 配置破坏性变更（第三代配置：bot 级共用 + 单侧覆盖；旧 v1/v2 配置会报迁移提示）
+  与 db 自动清理必须在 release notes 里写清楚；
 - 不要提内部基础设施（内网地址、服务器名、私有部署细节），也不要带真实账号信息；
 - 预发布（`-alpha` / `-beta` / `-rc`）勾选 pre-release，正式版不勾。
