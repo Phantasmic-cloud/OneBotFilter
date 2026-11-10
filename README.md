@@ -1,35 +1,31 @@
 # OneBotFilter
 
-[中文文档](./docs/README_zh.md) | English
+[中文](./docs/README_zh.md) | English
 
-A WebSocket filtering gateway for OneBot v11: one OneBot implementation connects in,
-multiple bot applications connect out, and messages reach a bot only after passing
-global switches and per-bot allow lists.
+A reverse-WebSocket gateway for OneBot v11. It sits between one OneBot
+implementation and several bot applications, and forwards an event to a bot only
+after the global switch, the global blacklist, the bot's own allow list and its
+content filters pass.
 
-- Pure Rust, no CGO: a single static-ish binary
-- Reverse WebSocket on both sides (server towards the OneBot implementation, client towards bot apps)
-- **Group and private chat both supported**: group switches + per-bot group lists for groups;
-  a global private-user whitelist + per-bot private-user lists for direct messages
-- Per-bot content filters (prefix / whitelist / blacklist) configured separately for group and private messages
-- Outbound text can be rewritten with regex rules; rewritten echoes are scrubbed from API responses
-- Runtime state (switches, lists, caches) lives in `db.json`; stale bot/group state is pruned automatically
+This repository is a Rust rewrite of
+[xuanmingLQ/OneBotFilter](https://github.com/xuanmingLQ/OneBotFilter) (Go).
+
+## Features
+
+- Group and private chat, each with its own global switch, per-bot allow list and content filters
+- Hot-reloaded filters; optional outbound text rewriting with echo scrubbing
+- Runtime state in `db.json`; stale bot/group state is pruned automatically
+
+## Requirements
+
+- Rust 1.85+ (to build)
+- A OneBot v11 implementation that can connect as a reverse-WS client
+- One or more bot apps that accept reverse-WS connections
 
 ## Quick start
 
-```bash
-# Build from source (release). Requires Rust 1.85+.
-cargo build --release          # -> target/release/onebotfilter
-# or: sh scripts/build.sh
-
-cp config-example.yaml config.yaml
-./target/release/onebotfilter
-```
-
-The gateway listens on `ws://<host>:<port>/ws` for the OneBot implementation and
-connects out to each `bot-apps[].uri`. Once the log prints `OneBotFilter已启动 ...`,
-it is ready.
-
-Prebuilt release binaries:
+Prebuilt binaries are attached to
+[Releases](https://github.com/Phantasmic-cloud/OneBotFilter/releases):
 
 ```text
 onebotfilter-linux-amd64
@@ -37,35 +33,29 @@ onebotfilter-windows-amd64.exe
 onebotfilter-macos-arm64
 ```
 
-## Layout
+Or build from source:
 
-```
-src/
-  main.rs            entry point
-  lib.rs             startup wiring: config, state, listener, clients, hot reload
-  global.rs          shared App state, connections, counters, filter registry
-  config.rs          config (mode.group/private, message.group/private), validation, hot reload
-  message.rs         shared message segment / outbound message model
-  onebot_api.rs      typed OneBot actions, echo correlation, response parsing
-  gate.rs            shared group/private gating
-  store.rs           db.json state: switches, allow lists, caches, pruning
-  api.rs             high-level API: group names, group list, latency
-  onebot_message.rs  inbound event parsing, @me, command text
-  filters.rs         content filters (group and private configs)
-  rewrite.rs         outbound text rewriting and echo scrubbing
-  command.rs         built-in chat commands and status text
-  dispatch.rs        inbound dispatch and delivery
-  server.rs          upstream OneBot connection (single)
-  client.rs          downstream bot connections, reconnect, latency probe
-tests/gateway.rs     end-to-end integration tests
-docs/README_zh.md    full Chinese guide
-docs/API.md          protocol, config and internal API reference
-AGENTS.md            architecture and contribution notes
+```bash
+cargo build --release
+cp config-example.yaml config.yaml
+./target/release/onebotfilter
 ```
 
-Configuration, the command list and the gating order are documented in
-[`docs/API.md`](./docs/API.md) and [`AGENTS.md`](./AGENTS.md).
+The OneBot implementation connects to `ws://127.0.0.1:3939/ws`; the gateway
+dials every `bot-apps[].uri`. The log line `OneBotFilter已启动 ...` means ready.
+
+## Docs
+
+- [Chinese guide](./docs/README_zh.md)
+- [Protocol, config and API reference](./docs/API.md)
+- [Architecture notes](./AGENTS.md)
+
+## Credits
+
+- [xuanmingLQ/OneBotFilter](https://github.com/xuanmingLQ/OneBotFilter) — the original Go implementation
+- [OneBot v11](https://github.com/botuniverse/onebot-11) — protocol specification
 
 ## License
 
-[Apache License 2.0](./LICENSE). Third-party components are listed in [`NOTICE`](./NOTICE).
+[Apache License 2.0](./LICENSE). Third-party components are listed in
+[NOTICE](./NOTICE).

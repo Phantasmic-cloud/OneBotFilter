@@ -4,6 +4,9 @@
 
 ## 这是什么
 
+原项目：[xuanmingLQ/OneBotFilter](https://github.com/xuanmingLQ/OneBotFilter)（Go 实现），
+本仓库是它的 Rust 重写版，协议与过滤行为保持兼容。
+
 一个 OneBot v11 消息过滤网关。一条流量路径：
 
 ```

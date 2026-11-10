@@ -9,7 +9,8 @@ Copilot 等）看，也是接手本项目的第一份材料。如果仓库里还
 
 ## 项目概述
 
-OneBotFilter 是 OneBot v11 的 WebSocket 消息过滤网关。它同时扮演两个角色：
+OneBotFilter 是 OneBot v11 的 WebSocket 消息过滤网关，也是
+[xuanmingLQ/OneBotFilter](https://github.com/xuanmingLQ/OneBotFilter)（Go 原版）的 Rust 重写版。它同时扮演两个角色：
 
 - 对**上游 OneBot 实现**是**客户端**：OneBot 实现（NapCat、Lagrange、LLOneBot 等）
   主动连 `ws://<host>:<port><suffix>`，本程序只接受一个连接；
